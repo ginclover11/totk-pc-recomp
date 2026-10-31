@@ -211,7 +211,10 @@ static void oq_cb(void *arg) {
         // completion thread, and with it every later callback, for good. It counts as visible (one sample).
         VkResult r = vkGetQueryPoolResults(dev, oq_pool, s->q[i], j - i, sizeof v, v, 2 * sizeof v[0],
                                            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
-        if (r != VK_SUCCESS && r != VK_NOT_READY) rt_fatal("vk: occlusion query results failed (%d)", (int)r);
+        if (r != VK_SUCCESS && r != VK_NOT_READY) {
+            vk_device_fault_report(r);
+            rt_fatal("vk: occlusion query results failed (%d)", (int)r);
+        }
         vkResetQueryPool(dev, oq_pool, s->q[i], j - i);
         for (uint32_t k = i; k < j; k++) {
             if (v[2 * (k - i) + 1]) sum += v[2 * (k - i)];

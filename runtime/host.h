@@ -249,6 +249,9 @@ void res_heapdef_served(void);                             // romfs.c serves the
 void res_init(void);                                       // after rt_patches_init: the patch page and the sets
 void res_sizes(unsigned out[2], unsigned scene[2]);      // the output and scene sizes in effect (the game's own
                                                            // until res_init switched the sets on)
+int res_is_16x9(unsigned w, unsigned h);                   // within 1% of 16:9 (the test res_init and romfs.c share)
+int res_wants_wide_overlay(const unsigned out[2]);         // not 16:9 on a game version with the camera aspect patch
+void res_wanted(unsigned out[2]);                          // the output size TOTK_OUTPUT_RES asks for
 // ---- code patches (patches.c) and the frame step (frame_rate.c)
 void rt_patches_init(void);                                // after ldr_load: switches from the environment, the patch
                                                            // page committed; logs the sets
@@ -288,6 +291,7 @@ void rt_boot(void);                                        // boot.c
 // modules, registers its host functions, then seals (hostfn_seal, or implicitly at the first rt_call). Return the
 // process exit code.
 int probe_cfg(void);                                       // cfg_probe.c
+int probe_dpi(void);                                       // dpi_probe_win.c, gfx_window_posix.c
 int probe_loader(void), probe_kernel(void), probe_ipc(void), probe_services(void), probe_fs(void);
 int probe_gfx_abi(void);                                   // gfx_abi_probe.c
 int probe_vkdevice(void);                                 // vk_device.c

@@ -12,6 +12,7 @@
 // is also fixed at init; they are looked up only after the flat table misses.
 #include "dispatch.h"
 #include "host.h"
+#include "platform/platform.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -47,6 +48,11 @@ void rt_fatal(const char *fmt, ...) {
     rt_vlogf(fmt, ap);
     rt_log_raw("\n", 1);
     va_end(ap);
+    // A failed allocation (malloc, realloc, VirtualAlloc) means the commit limit was reached: this line tells a leak of
+    // ours (process private bytes near the limit) from a machine short of page file.
+    double proc, used, limit;
+    plat_commit_info(&proc, &used, &limit);
+    rt_log("fatal: memory commit: this process %.0f MB, the system %.0f of %.0f MB", proc, used, limit);
     fflush(stdout);
     fflush(stderr);
     _Exit(70);

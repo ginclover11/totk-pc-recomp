@@ -21,7 +21,7 @@
 #include "ui/menu.h"
 #include "vk.h"
 
-enum { STICK_MAX = 32767, STICK_DEAD = 2500, STICK_DIR = 16384, TRIGGER_ON = 16384, RESCAN_MS = 1000 };
+enum { STICK_MAX = 32767, STICK_DIR = 16384, TRIGGER_ON = 16384, RESCAN_MS = 1000 };
 
 static PlatMutex lock = PLAT_MUTEX_INIT;
 static int state;                    // 0 not started, 1 running, -1 disabled or SDL failed
@@ -45,6 +45,8 @@ static const SDL_GamepadButton pad_sdl[PAD_COUNT] = {
     [PAD_R] = SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, [PAD_START] = SDL_GAMEPAD_BUTTON_START, [PAD_BACK] = SDL_GAMEPAD_BUTTON_BACK,
     [PAD_DPAD_LEFT] = SDL_GAMEPAD_BUTTON_DPAD_LEFT, [PAD_DPAD_UP] = SDL_GAMEPAD_BUTTON_DPAD_UP,
     [PAD_DPAD_RIGHT] = SDL_GAMEPAD_BUTTON_DPAD_RIGHT, [PAD_DPAD_DOWN] = SDL_GAMEPAD_BUTTON_DPAD_DOWN,
+    [PAD_LPADDLE1] = SDL_GAMEPAD_BUTTON_LEFT_PADDLE1, [PAD_RPADDLE1] = SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1,
+    [PAD_LPADDLE2] = SDL_GAMEPAD_BUTTON_LEFT_PADDLE2, [PAD_RPADDLE2] = SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2,
 };
 
 // TOTK_INPUT_SCRIPT=<file>: lines "<frame> <button> [hold]" or "<frame> LSTICK|RSTICK <x> <y> [hold]", ORed into the real input.
@@ -267,9 +269,21 @@ int input_ui_holds_cursor(void) {
     return __atomic_load_n(&g_block, __ATOMIC_SEQ_CST) == 1 || __atomic_load_n(&g_menu, __ATOMIC_SEQ_CST) == 1;
 }
 
-static int32_t axis(int16_t v) {
-    int32_t a = v < -STICK_MAX ? -STICK_MAX : v;
-    return a > -STICK_DEAD && a < STICK_DEAD ? 0 : a;
+static float stick_dead = -1;              // TOTK_STICK_DEADZONE as a fraction of full deflection; live (cfg_version)
+static unsigned stick_dead_seen;
+
+static float stick_dead_get(void) {
+    unsigned ver = cfg_version();
+    if (stick_dead >= 0 && ver == stick_dead_seen) return stick_dead;
+    stick_dead_seen = ver;
+    double v = cfg_double("TOTK_STICK_DEADZONE");
+    stick_dead = (float)(v < 0 ? 0 : v > 50 ? 50 : v) / 100.f;
+    return stick_dead;
+}
+
+// One gamepad stick through the dead zone; SDL's Y grows downwards, the Switch's upwards.
+static void stick(SDL_GamepadAxis ax, SDL_GamepadAxis ay, float dead, int32_t out[2]) {
+    input_pad_stick(SDL_GetGamepadAxis(pad, ax), -(int32_t)SDL_GetGamepadAxis(pad, ay), dead, out);
 }
 
 // Open the first gamepad when none is open or the open one went away; logs once per change.
@@ -342,12 +356,44 @@ static void binds_refresh(void) {
     input_map_configure();
 }
 
+// TOTK_TEST_PAD=<lx>,<ly>,<rx>,<ry> (test runs): an SDL virtual gamepad whose sticks rest at these raw SDL axis values
+// (-32768..32767, down is +y), attached before the first scan so it is the gamepad the game reads: drift and full
+// deflection go through the same mapping and dead zone as a real pad.
+static void test_pad_attach(void) {
+    static SDL_Joystick *joy;   // kept open: a virtual joystick's axes are set through an open handle
+    const char *e = cfg_get("TOTK_TEST_PAD");
+    int v[4];
+    if (!e || !*e) return;
+    if (sscanf(e, "%d,%d,%d,%d", &v[0], &v[1], &v[2], &v[3]) != 4) {
+        rt_log("input: TOTK_TEST_PAD=%s is not <lx>,<ly>,<rx>,<ry>; no test gamepad", e);
+        return;
+    }
+    SDL_VirtualJoystickDesc d;
+    SDL_INIT_INTERFACE(&d);
+    d.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+    d.naxes = SDL_GAMEPAD_AXIS_COUNT;
+    d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+    d.name = "TotK test gamepad";
+    SDL_JoystickID id = SDL_AttachVirtualJoystick(&d);
+    joy = id ? SDL_OpenJoystick(id) : NULL;
+    if (!joy) {
+        rt_log("input: test gamepad not attached (%s)", SDL_GetError());
+        return;
+    }
+    static const SDL_GamepadAxis axes[4] = {SDL_GAMEPAD_AXIS_LEFTX, SDL_GAMEPAD_AXIS_LEFTY, SDL_GAMEPAD_AXIS_RIGHTX,
+                                            SDL_GAMEPAD_AXIS_RIGHTY};
+    for (int i = 0; i < 4; i++)
+        SDL_SetJoystickVirtualAxis(joy, axes[i], (Sint16)(v[i] < -32768 ? -32768 : v[i] > 32767 ? 32767 : v[i]));
+    rt_log("input: test gamepad attached, sticks at %d,%d %d,%d", v[0], v[1], v[2], v[3]);
+}
+
 static void start(void) {
     binds_refresh();
     const char *e = cfg_get("TOTK_INPUT");
     if (e && !strcmp(e, "none")) { state = -1; rt_log("input: disabled (TOTK_INPUT=none)"); return; }
     if (!SDL_Init(SDL_INIT_GAMEPAD)) { state = -1; rt_log("input: SDL gamepad init failed (%s), keyboard only", SDL_GetError()); }
     else state = 1;
+    if (state == 1) test_pad_attach();
     if (state == 1) {
         scan_pads();
         if (!pad) rt_log("input: no gamepad (keyboard only until one is connected)");
@@ -375,6 +421,7 @@ static int pad_physical(uint8_t pd[PAD_COUNT]) {
     for (int p = PAD_SOUTH; p < PAD_ZL; p++) pd[p] = SDL_GetGamepadButton(pad, pad_sdl[p]);
     pd[PAD_ZL] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > TRIGGER_ON;
     pd[PAD_ZR] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > TRIGGER_ON;
+    for (int p = PAD_ZR + 1; p < PAD_COUNT; p++) pd[p] = SDL_GetGamepadButton(pad, pad_sdl[p]);   // false without paddles
     return 1;
 }
 
@@ -384,10 +431,9 @@ static int pad_read(uint64_t *b, int32_t sl[2], int32_t sr[2]) {
     uint8_t pd[PAD_COUNT] = {0};
     if (!pad_physical(pd)) return 0;
     *b |= input_map_pad_buttons(pd, pad_layout_get());
-    sl[0] = axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX));
-    sl[1] = -axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY));
-    sr[0] = axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX));
-    sr[1] = -axis(SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY));
+    float dead = stick_dead_get();
+    stick(SDL_GAMEPAD_AXIS_LEFTX, SDL_GAMEPAD_AXIS_LEFTY, dead, sl);
+    stick(SDL_GAMEPAD_AXIS_RIGHTX, SDL_GAMEPAD_AXIS_RIGHTY, dead, sr);
     return 1;
 }
 

@@ -30,6 +30,7 @@ static volatile LONG g_focus_msgs;
 static int g_wnd_failed;
 static int g_background;                   // TOTK_BACKGROUND_WINDOW: the window stays behind the user's windows
 static int g_fs_pending;                   // window thread: TOTK_FULLSCREEN waits for the first activation
+static volatile LONG g_dpi = USER_DEFAULT_SCREEN_DPI;   // the window's DPI, set by the window thread
 
 // ---- focus
 int gfx_window_focused(void) { return g_focused; }
@@ -45,6 +46,18 @@ static WINDOWPLACEMENT g_saved_place = {sizeof g_saved_place};   // the window b
 
 static int is_fullscreen(HWND h) { return !(GetWindowLongW(h, GWL_STYLE) & WS_OVERLAPPEDWINDOW); }
 
+unsigned gfx_window_dpi(void) { return (unsigned)InterlockedCompareExchange(&g_dpi, 0, 0); }
+
+// The outer size of a framed window whose client area is cw x ch. The frame is measured at the window's DPI, or the
+// system DPI before the window exists: plain AdjustWindowRect always takes the system DPI, which is wrong on a monitor
+// at another display scale.
+static void outer_size(HWND h, int cw, int ch, int *ow, int *oh) {
+    RECT r = {0, 0, cw, ch};
+    AdjustWindowRectExForDpi(&r, WND_STYLE, FALSE, 0, h ? GetDpiForWindow(h) : GetDpiForSystem());
+    *ow = r.right - r.left;
+    *oh = r.bottom - r.top;
+}
+
 // TOTK_FULLSCREEN=1: borderless window over the monitor. TOTK_WINDOW_SIZE=<w>x<h>: client area of the window (the
 // swapchain follows the window; the game image is scaled to it).
 static int cfg_fullscreen(void) {
@@ -57,6 +70,16 @@ static void cfg_window_size(int *w, int *h) {
         sscanf(cfg_meta("WINDOW_SIZE")->def, "%dx%d", &x, &y);   // unparsable or out of range: the default
     *w = x;
     *h = y;
+}
+
+// Windows turns the display off and sleeps after the idle timeout, and gamepad input does not count as activity. While
+// the window is up and not minimized it holds the display and the system on, as other games do. The state belongs to
+// the calling thread, so only the window thread (window_main and wnd_proc) calls this; the process exit releases it.
+static void keep_awake(int on) {
+    static int cur = -1;
+    if (on == cur) return;
+    cur = on;
+    SetThreadExecutionState(on ? ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED : ES_CONTINUOUS);
 }
 
 // F11: borderless window over the whole monitor, and back to the saved window. The swapchain follows through WM_SIZE.
@@ -98,20 +121,18 @@ static void apply_settings(HWND h) {
     int size_changed = strcmp(cfg_value("TOTK_WINDOW_SIZE"), g_applied_size) != 0, fs = cfg_fullscreen(), fs_changed = fs != g_applied_fs;
     note_applied();
     if (size_changed) {
-        int cw, ch;
+        int cw, ch, ow, oh;
         cfg_window_size(&cw, &ch);
-        RECT r = {0, 0, cw, ch};
-        AdjustWindowRect(&r, WND_STYLE, FALSE);
+        outer_size(h, cw, ch, &ow, &oh);
         if (is_fullscreen(h)) {
             RECT *n = &g_saved_place.rcNormalPosition;
-            n->right = n->left + (r.right - r.left);
-            n->bottom = n->top + (r.bottom - r.top);
+            n->right = n->left + ow;
+            n->bottom = n->top + oh;
         } else {
             RECT have;
             if (GetClientRect(h, &have) && (have.right != cw || have.bottom != ch)) {
                 if (IsZoomed(h)) ShowWindow(h, SW_RESTORE);
-                SetWindowPos(h, NULL, 0, 0, r.right - r.left, r.bottom - r.top,
-                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                SetWindowPos(h, NULL, 0, 0, ow, oh, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
             }
         }
     }
@@ -210,6 +231,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     case WM_SIZE:
+        keep_awake(w != SIZE_MINIMIZED);
         if (w != SIZE_MINIMIZED) gfx_present_mark_dirty();
         refresh_rate_update(h, 0);
         return 0;
@@ -219,6 +241,32 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_DISPLAYCHANGE:
         refresh_rate_update(h, 1);
         break;
+    case WM_GETDPISCALEDSIZE:   // a framed window keeps its client size in pixels on a monitor at another scale
+        if (!is_fullscreen(h) && !IsZoomed(h)) {
+            RECT c, r;
+            if (GetClientRect(h, &c)) {
+                r = (RECT){0, 0, c.right, c.bottom};
+                if (AdjustWindowRectExForDpi(&r, WND_STYLE, FALSE, 0, LOWORD(w))) {
+                    *(SIZE *)l = (SIZE){r.right - r.left, r.bottom - r.top};
+                    return TRUE;
+                }
+            }
+        }
+        break;   // DefWindowProc: Windows scales the size with the DPI
+    case WM_DPICHANGED: {   // display scale changed, or the window reached a monitor at another scale
+        const RECT *s = (const RECT *)l;
+        InterlockedExchange(&g_dpi, LOWORD(w));
+        rt_log("gfx: window DPI %u (%u%%)", LOWORD(w), LOWORD(w) * 100u / USER_DEFAULT_SCREEN_DPI);
+        if (is_fullscreen(h)) {   // keep covering the monitor the suggested rect lies on
+            MONITORINFO mi = {sizeof mi};
+            if (GetMonitorInfoW(MonitorFromRect(s, MONITOR_DEFAULTTONEAREST), &mi))
+                SetWindowPos(h, NULL, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                             mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        } else {
+            SetWindowPos(h, NULL, s->left, s->top, s->right - s->left, s->bottom - s->top, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        return 0;
+    }
     case WM_ACTIVATEAPP: {
         int in = w != 0;
         InterlockedExchange(&g_focused, in);
@@ -255,23 +303,25 @@ static DWORD WINAPI window_main(void *arg) {
                                             GetSystemMetrics(SM_CYSMICON), LR_SHARED),
                       .hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW), .lpszClassName = L"TotKRecompWindow"};
     RegisterClassExW(&wc);
-    int cw, ch;
+    int cw, ch, ow, oh;
     cfg_window_size(&cw, &ch);
-    RECT r = {0, 0, cw, ch};
-    AdjustWindowRect(&r, WND_STYLE, FALSE);
+    outer_size(NULL, cw, ch, &ow, &oh);
     // The window opens behind the user's windows without taking focus: it shows the game's blank loading frames for a
     // while, and must not cover what the player works on meanwhile. The game still counts itself in focus until the
     // first WM_ACTIVATEAPP, so loading goes on, and keyboard input waits for the foreground (input_win.c). Its taskbar
     // button flashes until it is brought up, and TOTK_FULLSCREEN waits for that first activation.
     // TOTK_BACKGROUND_WINDOW=1 (test runs): no flashing, never fullscreen at start, and F11 keeps the window's place.
     int background = g_background = cfg_get("TOTK_BACKGROUND_WINDOW") && atoi(cfg_get("TOTK_BACKGROUND_WINDOW"));
-    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"TotK Recomp", WND_STYLE, CW_USEDEFAULT, CW_USEDEFAULT,
-                             r.right - r.left, r.bottom - r.top, NULL, NULL, inst, NULL);
+    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"TotK Recomp", WND_STYLE, CW_USEDEFAULT, CW_USEDEFAULT, ow, oh, NULL,
+                             NULL, inst, NULL);
     if (!g_hwnd) {
         rt_log("gfx: CreateWindowEx failed (%lu)", GetLastError());
         g_wnd_failed = 1;
     } else {
-        SetWindowPos(g_hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        // The frame was measured at the system DPI; the window may have opened on a monitor at another scale.
+        InterlockedExchange(&g_dpi, (LONG)GetDpiForWindow(g_hwnd));
+        outer_size(g_hwnd, cw, ch, &ow, &oh);
+        SetWindowPos(g_hwnd, HWND_BOTTOM, 0, 0, ow, oh, SWP_NOMOVE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         if (!background) {
             FLASHWINFO fw = {.cbSize = sizeof fw, .hwnd = g_hwnd, .dwFlags = FLASHW_TRAY | FLASHW_TIMERNOFG};
             FlashWindowEx(&fw);
@@ -279,6 +329,7 @@ static DWORD WINAPI window_main(void *arg) {
         }
         note_applied();
         refresh_rate_update(g_hwnd, 1);
+        keep_awake(1);
     }
     SetEvent(g_wnd_ready);
     if (g_wnd_failed) return 1;
@@ -319,7 +370,7 @@ void gfx_os_client_size(int *w, int *h) {
 int gfx_os_minimized(void) { return IsIconic(g_hwnd) != 0; }
 
 void gfx_os_resize_client(int w, int h) {
-    RECT r = {0, 0, w, h};
-    AdjustWindowRect(&r, WND_STYLE, FALSE);
-    SetWindowPos(g_hwnd, NULL, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    int ow, oh;
+    outer_size(g_hwnd, w, h, &ow, &oh);
+    SetWindowPos(g_hwnd, NULL, 0, 0, ow, oh, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }

@@ -41,7 +41,7 @@ typedef struct VkCtx {
     int validation;                         // layer active
     int has_custom_border_color, has_eds, has_eds2, has_eds3, has_vertex_input_dynamic_state,
         has_conditional_rendering, has_transform_feedback, has_provoking_vertex, has_device_fault, has_memory_budget,
-        has_robustness2, has_buffer_device_address, has_fragment_shader_interlock,
+        has_robustness2, has_buffer_device_address, has_fragment_shader_interlock, has_buffer_marker,
         has_astc_ldr;                       // textureCompressionASTC_LDR (enabled when reported)
     // Feedback loops (maxwell.md 1.9, vk_exec_draw.c feedback_prepare): a draw samples a target of its open pass that
     // an earlier draw of the pass wrote. TOTK_FEEDBACK=0: VK_FEEDBACK_OFF (sampled in GENERAL without a barrier, the
@@ -61,8 +61,11 @@ typedef struct {
     uint32_t sg_size;                  // requiredSubgroupSize on sg_pin_stages (32)
     VkShaderStageFlags sg_pin_stages;  // 0: no pin, stages run at the device's subgroupSize
     int gpl;                           // VK_EXT_graphics_pipeline_library enabled with fast linking (TOTK_GPL=0: off)
+    int amd;                           // an AMD GPU (vendor 0x1002), any driver
+    int amd_sc;                        // AMD's Windows driver branch for RDNA 1 and 2 ("AMD proprietary shader compiler")
 } VkCaps;
 extern VkCaps vk_caps;
+void vk_caps_driver(VkPhysicalDevice p);             // first, before vkCreateDevice: vk_caps.amd, amd_sc
 void vk_caps_features(VkPhysicalDeviceFeatures *f);   // before vkCreateDevice (TOTK_VK_NO_FLOAT64 clears shaderFloat64)
 // Before vkCreateDevice, with the driver's graphics pipeline library feature and properties: sets vk_caps.gpl,
 // 1 = enable the extensions (VK_KHR_pipeline_library, VK_EXT_graphics_pipeline_library) and the feature.
@@ -74,6 +77,22 @@ VkCtx *vk_ctx(void);                        // NULL until vk_init() succeeded
 int vk_init(void);                          // idempotent; 1 on success, 0 on failure (reason logged with rt_log)
 void vk_shutdown(void);
 int vk_selftest(void);                      // 0 on success
+// Call with the result of a failed queue submit, present or wait before stopping on it: VK_ERROR_DEVICE_LOST logs
+// what VK_EXT_device_fault reports (description, faulting addresses with their precision, vendor codes) once per
+// process, after the GPU breadcrumbs (vk_crumbs_report). Any other result returns at once.
+void vk_device_fault_report(VkResult r);
+
+// ---- GPU breadcrumbs (vk_crumbs.c): with VK_AMD_buffer_marker, each crumb has the GPU write its code into host memory
+// twice, when the command processor reaches it and when all work before it has finished. After a lost device the two
+// codes bracket the work that hung. Without the extension every call returns at once.
+enum { VK_CRUMB_SUBMIT = 1, VK_CRUMB_SUBMIT_END, VK_CRUMB_UPLOAD, VK_CRUMB_UPLOAD_END, VK_CRUMB_ASTC, VK_CRUMB_PRESENT,
+       VK_CRUMB_PRESENT_END };
+void vk_crumbs_init(VkCtx *c);       // after the allocator exists
+void vk_crumbs_release(void);
+// Records crumb kind with number n (a timeline value, a batch number; the low 28 bits are kept) into cb. Only the
+// thread that records cb may call it: never into a replay part while the recorder thread owns it (vk_rec.h).
+void vk_crumb(VkCommandBuffer cb, int kind, uint64_t n);
+void vk_crumbs_report(void);         // logs the two codes and what they name
 
 // ---- window and present (gfx_present.c). Host threads only.
 // vk_present_image: blits the crop rectangle {x, y, w, h} of src (NULL, or w/h <= 0: the whole w x h image), scaled
@@ -86,11 +105,11 @@ void vk_present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w, in
 // vk_present_image split in two: vk_present_blit submits the blit and leaves the present waiting, vk_present_flip
 // queues it. The next blit or a swapchain rebuild queues a waiting present first.
 void vk_present_blit(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4]);
-// FSR 1 on the present (vk_fsr.c): records EASU (+ RCAS) of src's crop rectangle {x, y, w, h} into dst, a dw x dh
-// swapchain image in TRANSFER_DST; src is in GENERAL and fmt its format. 0 = nothing recorded (the setting says
-// bilinear, no upscale is needed, or FSR is not available): the caller blits.
+// FSR 1 on the present (vk_fsr.c): records EASU (+ RCAS) of src's crop rectangle {x, y, w, h} into the rectangle out
+// {x, y, w, h} of dst, a swapchain image in TRANSFER_DST; src is in GENERAL and fmt its format. 0 = nothing recorded
+// (the setting says bilinear, no upscale is needed, or FSR is not available): the caller blits.
 int vk_fsr_record(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, int sw, int sh, const int crop[4],
-                  VkImage dst, uint32_t dw, uint32_t dh);
+                  VkImage dst, const int out[4]);
 void vk_fsr_release(void);   // before the device goes away
 void vk_present_flip(void);
 // Every submission to ctx->gfx_queue (and xfer_queue when shared) takes this lock; vk_present_image and the swapchain
@@ -233,6 +252,7 @@ enum { VK_ASTC_CPU, VK_ASTC_GPU, VK_ASTC_NATIVE, VK_ASTC_CHECK };
 int vk_astc_mode(void);                 // decided once per device (logged); VK_ASTC_CPU before vk_init
 int vk_astc_native(VkFormat astc_fmt);  // 1: images of this ASTC format are created as such and get the raw blocks
 int vk_astc_gpu(void);                  // 1: ASTC images decoded to RGBA8 by the compute decoder (vk_astc_record)
+int vk_astc_bc(void);                   // 1: those images are BC3 instead, encoded after the decode (TOTK_ASTC_BC=1)
 // One image region decoded from raw blocks: tight rows of 16-byte blocks at byte src of the source buffer (slices one
 // after the other), w x h texels and slices deep, written at offset of level / layer.
 typedef struct { VkDeviceSize src; uint32_t w, h, slices, level, layer; VkOffset3D offset; } VkAstcRegion;
@@ -240,9 +260,10 @@ typedef struct { VkDeviceSize src; uint32_t w, h, slices, level, layer; VkOffset
 // bytes of blocks) goes to a device-local scratch buffer, a dispatch per region decodes it, and the texels are copied
 // into img (VK_IMAGE_LAYOUT_GENERAL). The caller records its usual barriers around an image copy before and after the
 // call. readback (optional, host-visible, TRANSFER_DST): also gets the decoded texels, the regions one after the other.
+// bc: img is BC3 (TexVkFormat.astc_bc); the texels are encoded to BC3 blocks before the copy, and readback is ignored.
 // 0 when the decoder is unavailable or the scratch buffer cannot be allocated (nothing recorded).
 int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, const VkAstcRegion *rg, int n, uint32_t bw,
-                   uint32_t bh, int srgb, VkImage img, VkImageAspectFlags aspect, VkBuffer readback);
+                   uint32_t bh, int srgb, int bc, VkImage img, VkImageAspectFlags aspect, VkBuffer readback);
 void vk_astc_stats(uint64_t *dispatches, uint64_t *texels);   // since start
 // TOTK_ASTC_TIME=1: GPU timestamps around each vk_astc_record's dispatches (logged per footprint and the largest one)
 void vk_astc_time_enable(int on);

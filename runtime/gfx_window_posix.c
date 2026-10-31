@@ -33,6 +33,7 @@ static PlatEvent *g_ready;
 static int g_failed;
 static volatile int32_t g_focused = 1, g_focus_msgs, g_minimized, g_px_w, g_px_h;
 static volatile int32_t g_rate_mhz, g_mon_w, g_mon_h;   // of the monitor the window is on; 0 unknown
+static volatile int32_t g_dpi = 96;
 
 static void post(int code) {
     if (!g_user_event) return;
@@ -92,6 +93,8 @@ static void monitor_update(void) {
     if (__atomic_exchange_n(&g_rate_mhz, mhz, __ATOMIC_SEQ_CST) != mhz) rt_log("gfx: monitor refresh rate %.3f Hz", hz);
     __atomic_store_n(&g_mon_w, (int32_t)((float)m->w * m->pixel_density), __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_mon_h, (int32_t)((float)m->h * m->pixel_density), __ATOMIC_SEQ_CST);
+    float scale = SDL_GetWindowDisplayScale(g_win);
+    if (scale > 0) __atomic_store_n(&g_dpi, (int32_t)(scale * 96 + 0.5f), __ATOMIC_SEQ_CST);
 }
 
 double gfx_window_refresh_hz(void) { return __atomic_load_n(&g_rate_mhz, __ATOMIC_SEQ_CST) / 1000.0; }
@@ -103,6 +106,9 @@ int gfx_window_monitor_size(int *w, int *h) {
     *h = mh;
     return 1;
 }
+
+// The menu's text size floor: 96 is 100%, as on Windows.
+unsigned gfx_window_dpi(void) { return (unsigned)__atomic_load_n(&g_dpi, __ATOMIC_SEQ_CST); }
 
 int gfx_window_focused(void) { return __atomic_load_n(&g_focused, __ATOMIC_SEQ_CST); }
 unsigned gfx_window_focus_messages(void) { return (unsigned)__atomic_load_n(&g_focus_msgs, __ATOMIC_SEQ_CST); }
@@ -262,6 +268,12 @@ int probe_window(void) {
     int ok = w > 0 && h > 0 && gfx_window_present_mode()[0];
     printf("probe-window: %s\n", ok ? "passed" : "FAILED");
     return !ok;
+}
+
+// --probe-dpi checks Windows' DPI awareness (dpi_probe_win.c); nothing to check here, the swapchain is in pixels.
+int probe_dpi(void) {
+    printf("probe-dpi: skipped: Windows only\n");
+    return 0;
 }
 
 // RenderDoc capture (rdoc_win.c): architecture.md says it cannot capture this renderer anyway.

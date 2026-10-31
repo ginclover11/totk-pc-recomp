@@ -180,5 +180,9 @@ void audio_mixer_update_effects(AudioRenderer *r);
 void audio_mixer_effect_result(AudioRenderer *r, int id, void *output, unsigned size);
 uint32_t audio_mixer_sink_written(AudioRenderer *r, int id);
 void audio_mixer_render(AudioRenderer *r, double seconds);   // after audio_voices_prepare, before voices advance
+// Device pacing for the render thread at kern_now_ns `now`: 0 renders the next frame now, a positive value waits that
+// many ns (the ring is at its target), -1 leaves the pace to the render thread's timer (no device, renderer stopped,
+// device stalled).
+int64_t audio_mixer_pace_ns(AudioRenderer *r, uint64_t now);
 int audio_buffer_empty(const AudrenWaveBuffer *b);   // no samples to decode: played as soon as it is reached
 void audio_device_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs);   // IAudioDevice

@@ -82,13 +82,16 @@ SDL3_DLLS = [UCRT / 'SDL3.dll', UCRT / 'libiconv-2.dll', UCRT / 'libopus-0.dll']
 # Flags for generated code as LAS Recomp builds it (Makefile GENFLAGS, Windows), plus -march for the FP/SIMD lowering.
 GEN_FLAGS = ['-O1', '-fno-strict-aliasing', '-Wno-return-type', '-Wno-unused-label', '-fvisibility=hidden',
              '-march=x86-64-v3']
-RT_FLAGS = ['-O2', '-g', '-Wall', '-fno-strict-aliasing', '-march=x86-64-v3']
-LINK_FLAGS = ['-fuse-ld=lld', '-Wl,--stack,16777216', '"-Wl,--Map=$builddir/totk.map"']   # the map feeds tools/prof_report.py
+# _WIN32_WINNT: Windows 10, the port's minimum. MSYS2's headers default to it, llvm-mingw's (the release toolchain) to
+# Windows 7, which hides the per-monitor DPI functions gfx_window_win.c and dpi_probe_win.c call.
+RT_FLAGS = ['-O2', '-g', '-Wall', '-fno-strict-aliasing', '-march=x86-64-v3', '-D_WIN32_WINNT=0x0A00']
+# -Xlinker passes the map path as one argument; -Wl, would split it at any comma in the build dir path
+LINK_FLAGS = ['-fuse-ld=lld', '-Wl,--stack,16777216', '-Xlinker', '"--Map=$builddir/totk.map"']   # the map feeds tools/prof_report.py
 if not WINDOWS:
     # Position independent: the kernel loads the image far above 2^39, out of the guest's way (recomp/layout.py).
     GEN_FLAGS += ['-fPIE']
-    RT_FLAGS += ['-fPIE', '-D_GNU_SOURCE']
-    LINK_FLAGS = ['-fuse-ld=lld', '-pie', '"-Wl,--Map=$builddir/totk.map"']
+    RT_FLAGS = [f for f in RT_FLAGS if not f.startswith('-D_WIN32_WINNT')] + ['-fPIE', '-D_GNU_SOURCE']
+    LINK_FLAGS = ['-fuse-ld=lld', '-pie', '-Xlinker', '"--Map=$builddir/totk.map"']
 LINK_LIBS = ['-lpsapi', '-lbcrypt', '-lvulkan-1', '-luser32', '-lgdi32', '-ldwmapi', '-lwinmm', '-lSDL3', '-lopus', '-l:libvpx.a', '-l:libzstd.a', '-l:libstdc++.a', '-l:libwinpthread.a']   # Vulkan back end; libvpx static (movies); libzstd static (resolution.c)
 if not WINDOWS:
     # Dynamic throughout: the distribution ships no libvpx.a or libzstd.a.
@@ -193,16 +196,18 @@ def write_if_changed(path, text):
 def copy_romfs_patches(version, out):
     """totk.exe loads romfs-patches beside romfs-index.bin (runtime/romfs.c overlay_init). tools/make_romfs_patches.py
     writes them into build/<version> only, so a build in another directory ran without the 60 fps overlay (the quick
-    menus' captured background turned black). Copies them when their manifest differs."""
-    src = ROOT / 'build' / version / 'romfs-patches'
-    dst = out / 'romfs-patches'
-    if src.resolve() == dst.resolve() or not (src / 'manifest.tsv').is_file():
-        return
-    if (dst / 'manifest.tsv').is_file() and (dst / 'manifest.tsv').read_bytes() == (src / 'manifest.tsv').read_bytes():
-        return
-    shutil.rmtree(dst, ignore_errors=True)
-    shutil.copytree(src, dst)
-    print(f'romfs patches: copied from {src}')
+    menus' captured background turned black). Copies them when their manifest differs; romfs-patches-xbox (the same with
+    the A/B and X/Y prompts swapped, pad_layout = xbox_prompts) the same way when it was made."""
+    for name in ('romfs-patches', 'romfs-patches-xbox'):
+        src = ROOT / 'build' / version / name
+        dst = out / name
+        if src.resolve() == dst.resolve() or not (src / 'manifest.tsv').is_file():
+            continue
+        if (dst / 'manifest.tsv').is_file() and (dst / 'manifest.tsv').read_bytes() == (src / 'manifest.tsv').read_bytes():
+            continue
+        shutil.rmtree(dst, ignore_errors=True)
+        shutil.copytree(src, dst)
+        print(f'romfs patches: copied {name} from {src}')
 
 
 def c_string(s):

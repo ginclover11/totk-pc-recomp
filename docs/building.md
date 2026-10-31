@@ -91,6 +91,9 @@ From the repository root, in PowerShell. Every step that depends on the game ver
    Lifting takes about 15 s, a clean compile about 200 s on 24 threads; later builds recompile only what changed.
    `--patches` builds in the frame-rate, resolution and other patch sets, switchable at run time. The link copies
    `SDL3.dll`, `libiconv-2.dll` and `libopus-0.dll` next to the exe.
+   For Xbox button prompts, run `make_romfs_patches.py` once more with `--xbox-prompts`: it writes
+   `build\<ver>\romfs-patches-xbox` ([controls.md](controls.md), "Xbox button prompts"); `build_game.py` copies it next
+   to `totk.exe` like `romfs-patches`.
 
 6. Prepare the shaders (once per build folder and translator). It needs `refs\MacNativeGames` (`tools\fetch_refs.sh`)
    for the shared shader list:
@@ -193,6 +196,12 @@ With the game, after writing `config.local.toml` as in step 2 above:
 .venv/bin/python recomp/gen.py --exefs build/extracted/v143/exefs --out generated/v143 --patches recomp/patches-v143.txt
 .venv-py314/bin/python tools/make_romfs_patches.py --version v143
 .venv/bin/python tools/build_game.py --version v143
+# once per build folder and translator: shaders translated ahead of play. tools/shader_list.py reads the shader list's
+# history, which tools/fetch_refs.sh does not fetch
+tools/fetch_refs.sh
+git -C refs/MacNativeGames fetch --unshallow origin main:refs/remotes/origin/main
+git -C refs/MacNativeGames symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+.venv-py314/bin/python tools/prepare_shaders.py build/v143 --version v143
 build/v143/totk --selftest
 TOTK_GPU=null build/v143/totk --boot
 build/v143/totk                          # play; settings in build/v143/totk.ini

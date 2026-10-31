@@ -266,8 +266,9 @@ class App:
         state = form.installed_state()
         if state is not None:
             self.update_hint.configure(text=self.cat('ui.update_mode'))
-            if state.get('lang') in ini.LANGUAGES and not self.lang_touched:
-                self.vars['lang'].set(self.lang_label(state['lang']))
+            recorded = ini.canonical_language(state.get('lang'))
+            if recorded in ini.LANGUAGES and not self.lang_touched:
+                self.vars['lang'].set(self.lang_label(recorded))
         else:
             self.update_hint.configure(text='')
         self.fit()

@@ -59,6 +59,7 @@ void gfx_window_apply_settings(void);     // TOTK_FULLSCREEN or TOTK_WINDOW_SIZE
 void gfx_window_request_close(void);      // as the window's close button: the process ends
 int gfx_window_monitor_size(int *w, int *h);   // pixels of the monitor the window is on; 0 when unknown
 double gfx_window_refresh_hz(void);            // its refresh rate (TOTK_FPS_LIMIT=display); 0 when unknown
+unsigned gfx_window_dpi(void);                 // the window's DPI (96 at 100% display scale); any thread
 // The present mode the swapchain got, as a TOTK_VK_PRESENT value ("fifo" when mailbox is missing); "" before the first
 // swapchain. Any thread.
 const char *gfx_window_present_mode(void);

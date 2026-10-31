@@ -6,7 +6,8 @@ tools/prepare_shaders.py, whose output goes to <temp>/logs/<step>-<tool>.log and
 here: the host check is a small C program built with the bundled clang (hostcheck.c).
 
 Install folder: exefs/, romfs/ (romfs.bin, index.json), profile/, totk.exe and its DLLs, romfs-index.bin,
-romfs-patches/, totk_xlate.exe, the shader state of totk.exe --prepare-shaders, totk.ini, totk-install.json.
+romfs-patches/, romfs-patches-xbox/, totk_xlate.exe, the shader state of totk.exe --prepare-shaders, totk.ini,
+totk-install.json.
 Temp folder (<temp>/<dest name>-<hash>): check/ (ExeFS of both inputs, the host check), gen/ (C), build/ (objects),
 logs/ (kept by the cleanup).
 """
@@ -203,7 +204,7 @@ class Check(Step):
             raise InstallError('check.dest_not_folder', path=str(dest))
         if ctx.mode == 'install' and dest.is_dir() and any(dest.iterdir()):
             raise InstallError('check.dest_not_empty', path=str(dest))
-        lang = ctx.options.lang or ctx.state.get('lang')
+        lang = ini.canonical_language(ctx.options.lang or ctx.state.get('lang'))
         if not lang:
             raise InstallError('check.lang_missing')
         if lang not in ini.LANGUAGES:
@@ -581,13 +582,17 @@ class Compile(Step):
 TRANSLATED = re.compile(r'gfx_shader: prepare: (\d+) of (\d+) pairs')
 
 
+WIDE_SIZES = ('2560x1080', '3440x1440', '3840x1600', '5120x2160')   # runtime/ui/menu.cpp row_output_res
+
+
 class Prepare(Step):
     id = 'prepare'
 
     def key(self, ctx):
         layout = ctx.layout
         xlate_id = layout.xlate.with_suffix('.id')
-        tools = [layout.tools / n for n in ('prepare_shaders.py', 'shader_census.py', 'make_romfs_patches.py')]
+        tools = [layout.tools / n for n in ('prepare_shaders.py', 'shader_census.py', 'make_romfs_patches.py',
+                                            'pack_shader_cache.py', 'ultrawide_layout.py')]
         return fingerprint('prepare-1', ctx.keys['compile'], layout.xlate, xlate_id, shader_list_text(layout), *tools)
 
     def current(self, ctx, record):
@@ -617,6 +622,28 @@ class Prepare(Step):
                               dest / 'romfs-patches'])
         if code:
             raise InstallError('prepare.romfs_patches_failed', code=code, log=str(log))
+        # The same overlay with the UI laid out for the 21:9 game resolutions the settings menu offers (runtime/romfs.c
+        # overlay_init picks the one that matches). Only 1.4.3 has the camera aspect patch (recomp/patches-v143.txt) the
+        # layouts go with, and ultrawide_layout.py is checked against 1.4.3's layout archive: 1.2.1 builds none.
+        for size in WIDE_SIZES:
+            remove(dest / f'romfs-patches-{size}')
+            if version_tag(game_version(ctx)) != 'v143':
+                continue
+            code, log = run_tool(ctx, 'prepare', layout.tools / 'make_romfs_patches.py',
+                                 ['--version', 'v143', '--romfs', dest / 'romfs', '--out',
+                                  dest / f'romfs-patches-{size}', '--aspect', size])
+            if code:
+                raise InstallError('prepare.romfs_patches_failed', code=code, log=str(log))
+        # romfs-patches-xbox: the same with the A/B and X/Y prompts swapped, for pad_layout = xbox_prompts (written on
+        # every install, so the menu choice works without another run of the setup). Optional: when it fails, the game
+        # keeps the Switch prompts and the menu says the files are missing, so the setup warns and goes on.
+        remove(dest / 'romfs-patches-xbox')
+        code, log = run_tool(ctx, 'prepare-xbox', layout.tools / 'make_romfs_patches.py',
+                             ['--version', version_tag(game_version(ctx)), '--romfs', dest / 'romfs', '--out',
+                              dest / 'romfs-patches-xbox', '--xbox-prompts'])
+        if code:
+            remove(dest / 'romfs-patches-xbox')
+            rep.warning('warn.xbox_prompts_failed', code=code, log=str(log))
 
         shader_list = layout.shader_list
         if not shader_list:
@@ -638,6 +665,12 @@ class Prepare(Step):
                               dest / 'exefs', '--list', shader_list], parse)
         if code or not (dest / 'shader-prepared.bin').is_file():
             raise InstallError('prepare.shaders_failed', code=code, log=str(log))
+
+        # One shader-cache.pack instead of four files per shader (~117,000): totk.exe reads the pack first.
+        rep.progress('prepare', 'pack', force=True)
+        code, log = run_tool(ctx, 'prepare', layout.tools / 'pack_shader_cache.py', [dest / 'shader-cache'])
+        if code:
+            raise InstallError('prepare.pack_failed', code=code, log=str(log))
         return {'xlate_sha256': file_sha256(xlate)}
 
 
@@ -661,7 +694,23 @@ class Cleanup(Step):
             remove(stale)
         for name in ('gen', 'build', 'check', 'shader_list.tsv'):
             remove(ctx.temp / name)
+        romfs_problem(dest / 'romfs', expected_update(ctx))
         return {}
+
+
+def romfs_problem(romfs, expected):
+    """Raise cleanup.romfs_unreadable unless romfs/ still holds the verified image. The game opens romfs.bin at start;
+    an install whose romfs/ went empty and unreadable after the extraction verified it (a folder Windows was still
+    deleting, #107) reported success and the game stopped at its first file read."""
+    try:
+        ok = extract.romfs_verified(romfs, expected) and (romfs / 'romfs.bin').stat().st_size == expected['romfs']['size']
+        if ok:
+            with open(romfs / 'romfs.bin', 'rb') as f:
+                f.read(1)
+    except (OSError, ValueError):
+        ok = False
+    if not ok:
+        raise InstallError('cleanup.romfs_unreadable', path=str(romfs))
 
 
 def all_steps():

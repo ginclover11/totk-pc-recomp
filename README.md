@@ -21,13 +21,14 @@ Report problems as issues, following [CONTRIBUTING.md](CONTRIBUTING.md).
 - Custom resolutions (1080p, 2k...), supersampling and AMD FSR 1 upscaling
 - In-game settings menu (F1) and performance overlay (F10)
 - Keyboard, mouse and gamepad with remapping, rumble and gyro
+- Xbox button prompts: a layout that keeps the Switch button positions and shows the Xbox labels
 - Shaders prepared at install instead of during play
 
 ## Planned
 
 - Linux and the Steam Deck
 - Mods made for emulators: unpack a mod into a `mods` folder
-- Custom aspect ratios, including ultrawide
+- Ultrawide on 1.2.1 (1.4.3 has it for 2560x1080, 3440x1440, 3840x1600 and 5120x2160; other shapes get the wide camera with a 16:9 HUD)
 - VRR
 
 ## Installing

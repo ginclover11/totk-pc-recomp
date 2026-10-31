@@ -185,7 +185,10 @@ static void completion_main(void *arg) {
             VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
                                       .pSemaphores = &c->timeline, .pValues = &want};
             VkResult r = vkWaitSemaphores(c->device, &wi, 100000000ull);   // 100 ms: stop is checked between waits
-            if (r != VK_SUCCESS && r != VK_TIMEOUT) rt_fatal("vk: vkWaitSemaphores failed (%d; device lost?)", (int)r);
+            if (r != VK_SUCCESS && r != VK_TIMEOUT) {
+                vk_device_fault_report(r);
+                rt_fatal("vk: vkWaitSemaphores failed (%d; device lost?)", (int)r);
+            }
             vkGetSemaphoreCounterValue(c->device, c->timeline, &reached);
             plat_mutex_lock(&st_lock);
             if (reached > issued) reached = issued;
@@ -288,9 +291,8 @@ static VkCommandBuffer prologue(VkCtx *c, uint64_t fence) {
 VkCommandBuffer vk_sync_split(void) {
     VkCtx *c = vk_ctx();
     VkCommandBuffer cb = slots[cur_slot].cb;
-    rec_end();   // every command of the part is in cb
     ts_end(cb, cur_fence);
-    vkEndCommandBuffer(cb);
+    if (!rec_end_cb(cb, 0, 0)) vkEndCommandBuffer(cb);   // every command of the part is in cb, ended by its recorder
     vk_upload_flush(0);   // the uploads this part asked for precede it in queue order
     VkCommandBuffer pro = prologue(c, cur_fence);
     VkCommandBufferSubmitInfo cbi[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = pro},
@@ -300,12 +302,16 @@ VkCommandBuffer vk_sync_split(void) {
     vk_queue_lock();
     VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
     vk_queue_unlock();
-    if (r != VK_SUCCESS) rt_fatal("vk: vkQueueSubmit2 of a part of value %llu failed (%d)", (unsigned long long)cur_fence, (int)r);
+    if (r != VK_SUCCESS) {
+        vk_device_fault_report(r);
+        rt_fatal("vk: vkQueueSubmit2 of a part of value %llu failed (%d)", (unsigned long long)cur_fence, (int)r);
+    }
     vk_mem_note_submit(cur_fence);   // objects destroyed from here on may be in use by the part just submitted
     CmdSlot *s = take_slot(c, cur_fence);   // the submitted part keeps its slot until the value is reached
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     vkBeginCommandBuffer(s->cb, &bi);
+    vk_crumb(s->cb, VK_CRUMB_SUBMIT, cur_fence);
     ts_begin(s->cb);
     rec_begin(s->cb);
     return s->cb;
@@ -334,14 +340,15 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     uint64_t t0 = perf_begin();
     vkBeginCommandBuffer(s->cb, &bi);
+    vk_crumb(s->cb, VK_CRUMB_SUBMIT, fence);
     ts_begin(s->cb);
     rec_begin(s->cb);
     int recorded = vk_exec_record(s->cb, handles, n, fence);
     s = &slots[cur_slot];   // the last part (vk_sync_split)
-    rec_end();
     if (recorded) ts_end(s->cb, fence);
     else ts_drop();
-    vkEndCommandBuffer(s->cb);
+    // The recorder is done with the part: the end-of-submission crumb, then the end, by the recorder when it records.
+    if (!rec_end_cb(s->cb, VK_CRUMB_SUBMIT_END, fence)) vkEndCommandBuffer(s->cb);
     perf_replay(t0);
     // After the recording: the uploads it asked for (and every earlier one) precede it in queue order.
     vk_upload_flush(0);
@@ -358,7 +365,10 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
     vk_queue_lock();
     VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
     vk_queue_unlock();
-    if (r != VK_SUCCESS) rt_fatal("vk: vkQueueSubmit2 of value %llu failed (%d)", (unsigned long long)fence, (int)r);
+    if (r != VK_SUCCESS) {
+        vk_device_fault_report(r);
+        rt_fatal("vk: vkQueueSubmit2 of value %llu failed (%d)", (unsigned long long)fence, (int)r);
+    }
     s->fence = recorded ? fence : 0;
     vk_mem_note_submit(fence);
     plat_mutex_lock(&st_lock);

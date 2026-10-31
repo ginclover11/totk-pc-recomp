@@ -87,12 +87,16 @@ static const char *switch_language(const char *tag) {
     return "en-US";
 }
 
-// The game's language as a Switch language code (TOTK_LANG, else TOTK_LOCALE, else the Windows user locale).
+// The game's language as a Switch language code (TOTK_LANG, else TOTK_LOCALE, else the Windows user locale). TotK
+// accepts "zh-Hans" and "zh-Hant" for Chinese and falls back to Japanese for "zh-CN" and "zh-TW", so those two
+// spellings, which older totk.ini files and menus wrote, are mapped to them.
 const char *ov_language(void) {
-    static const char *const codes[] = {"ja", "en-US", "fr", "de", "it", "es", "zh-CN", "ko", "nl", "pt", "ru",
-                                        "zh-TW", "en-GB", "fr-CA", "es-419", "zh-Hans", "zh-Hant", "pt-BR"};
+    static const char *const codes[] = {"ja", "en-US", "fr", "de", "it", "es", "ko", "nl", "pt", "ru",
+                                        "en-GB", "fr-CA", "es-419", "zh-Hans", "zh-Hant", "pt-BR"};
     const char *code = cfg_get("TOTK_LANG");   // no fixed default: TOTK_LOCALE or the Windows user locale decides when unset
     if (code && *code) {
+        if (!strcmp(code, "zh-CN")) return "zh-Hans";
+        if (!strcmp(code, "zh-TW")) return "zh-Hant";
         for (size_t i = 0; i < sizeof codes / sizeof *codes; i++)
             if (!strcmp(code, codes[i])) return codes[i];
         rt_fatal("TOTK_LANG '%s' is not a Switch language code", code);

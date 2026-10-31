@@ -203,13 +203,17 @@ static uint32_t overlay_slot(uint64_t i) {
 }
 
 // ---- overlays
-static void overlay_load(const char *dir) {
+// Loads and checks one overlay folder. A failed check stops the game, except with optional set (the Xbox prompts
+// folder): the folder is dropped, the reason logged, and 0 returned. Returns 1 when the folder is loaded or has no
+// manifest.
+static int overlay_load(const char *dir, int optional) {
+#define BAD(...) do { if (!optional) rt_fatal(__VA_ARGS__); rt_log(__VA_ARGS__); goto bad; } while (0)
     char path[2100];
     need(snprintf(path, sizeof path, "%s/manifest.tsv", dir) < (int)sizeof path, "overlay path");
     FILE *m = plat_fopen(path, "rb");
     if (!m) {
         rt_log("RomFS overlay: none (%s)", path);
-        return;
+        return 1;
     }
     char line[8192];
     size_t first = noverlay;
@@ -225,30 +229,32 @@ static void overlay_load(const char *dir) {
         uint64_t i = lower(name);
         int known = i < file_count && !strcmp(entry_name(entry(i)), name), add = !strcmp(orig, "-");
         if (!known && !add)
-            rt_fatal("RomFS overlay: %s/manifest.tsv names %s, which the RomFS lacks; a new file has \"-\" as its "
-                     "original's SHA-256", dir, name);
+            BAD("RomFS overlay: %s/manifest.tsv names %s, which the RomFS lacks; a new file has \"-\" as its "
+                "original's SHA-256", dir, name);
         if (known && add)
-            rt_fatal("RomFS overlay: %s/manifest.tsv adds %s, which the RomFS already has; give its original's SHA-256",
-                     dir, name);
+            BAD("RomFS overlay: %s/manifest.tsv adds %s, which the RomFS already has; give its original's SHA-256",
+                dir, name);
         Entry e = {0};
         if (known) {
             e = entry(i);
             sha_range(image, e.offset, e.size, hex, 0);
-            if (strcmp(hex, orig)) rt_fatal("RomFS overlay: the original of %s has SHA-256 %s, %s/manifest.tsv says %s",
-                                            name, hex, dir, orig);
+            if (strcmp(hex, orig)) BAD("RomFS overlay: the original of %s has SHA-256 %s, %s/manifest.tsv says %s",
+                                       name, hex, dir, orig);
         } else {
             i = ADDED;
         }
         char file[8200];
         need(snprintf(file, sizeof file, "%s/%s", dir, name) < (int)sizeof file, "overlay file path");
         PlatFile *f = open_read(file, 1);
-        if (!f) rt_fatal("RomFS overlay: %s missing", file);
+        if (!f) BAD("RomFS overlay: %s missing", file);
         Identity id = identity_of(f);
-        if (id.size != size) rt_fatal("RomFS overlay: %s has %llu bytes, its manifest says %llu", file,
-                                      (unsigned long long)id.size, size);
+        if (id.size != size) {
+            plat_file_close(f);
+            BAD("RomFS overlay: %s has %llu bytes, its manifest says %llu", file, (unsigned long long)id.size, size);
+        }
         sha_range(f, 0, size, hex, 0);
         plat_file_close(f);
-        if (strcmp(hex, sha)) rt_fatal("RomFS overlay: %s has SHA-256 %s, its manifest says %s", file, hex, sha);
+        if (strcmp(hex, sha)) BAD("RomFS overlay: %s has SHA-256 %s, its manifest says %s", file, hex, sha);
         hashed += e.size + size;
         if (noverlay == overlay_cap) {
             overlay_cap = overlay_cap ? overlay_cap * 2 : 16;
@@ -266,6 +272,16 @@ static void overlay_load(const char *dir) {
                                       noverlay - first - 16);
     if (noverlay > first) rt_log("RomFS overlay: %s checked, %zu files, %.1f MiB hashed in %.2f s", dir,
                                  noverlay - first, hashed / 1048576.0, now_s() - t0);
+    return 1;
+bad:
+    fclose(m);
+    for (size_t k = first; k < noverlay; k++) {
+        free((void *)overlays[k].path);
+        free((void *)overlays[k].name);
+    }
+    noverlay = first;
+    return 0;
+#undef BAD
 }
 
 static int overlay_order(const void *a, const void *b) {
@@ -358,18 +374,59 @@ static void heapdef_overlay(void) {
     res_heapdef_served();
 }
 
+static int xbox_prompts_ready;    // romfs-patches-xbox/manifest.tsv was next to romfs-index.bin at start
+static int xbox_prompts_active;   // and overlay_init loaded it
+
+int romfs_xbox_prompts_ready(void) { return xbox_prompts_ready; }
+int romfs_xbox_prompts_active(void) { return xbox_prompts_active; }
+
 static void overlay_init(void) {
-    // TOTK_ROMFS_PATCHES unset: romfs-patches next to romfs-index.bin if it has a manifest (tools/make_romfs_patches.py)
-    char def[2100];
+    // TOTK_ROMFS_PATCHES unset: romfs-patches next to romfs-index.bin if it has a manifest (tools/make_romfs_patches.py).
+    // A game resolution that is not 16:9 takes romfs-patches-<w>x<h> instead when it is there: the same overlay with
+    // the UI laid out for that shape (make_romfs_patches.py --aspect). 1.2.1 has no camera aspect patch, so it keeps
+    // the 16:9 layout (res_wants_wide_overlay).
+    // With pad_layout = xbox_prompts, romfs-patches-xbox in its place: the same patches with the A/B and X/Y prompts
+    // swapped (make_romfs_patches.py --xbox-prompts). The game reads the archives once at boot, so the prompts stay
+    // until restart even though the layout itself changes live. Each folder replaces romfs-patches as a whole and the
+    // setup builds no wide folder with Xbox prompts, so a wide game resolution keeps the Switch prompts.
+    char def[2100], xbox[2100];
     const char *patches = cfg_get("TOTK_ROMFS_PATCHES");
-    if (!patches && snprintf(def, sizeof def, "%s/romfs-patches/manifest.tsv", index_dir) < (int)sizeof def &&
+    int wide = 0;
+    unsigned out[2];
+    res_wanted(out);
+    if (!patches && res_wants_wide_overlay(out)) {
+        if (snprintf(def, sizeof def, "%s/romfs-patches-%ux%u/manifest.tsv", index_dir, out[0], out[1]) < (int)sizeof def &&
+            plat_file_exists(def)) {
+            def[strlen(def) - strlen("/manifest.tsv")] = 0;
+            patches = def, wide = 1;
+        } else {
+            rt_log("RomFS overlay: no romfs-patches-%ux%u for this game resolution, the UI keeps its 16:9 layout "
+                   "(tools/make_romfs_patches.py --aspect %ux%u)", out[0], out[1], out[0], out[1]);
+        }
+    }
+    xbox_prompts_ready =
+        snprintf(xbox, sizeof xbox, "%s/romfs-patches-xbox/manifest.tsv", index_dir) < (int)sizeof xbox &&
+        plat_file_exists(xbox);
+    int want_xbox = !strcasecmp(cfg_value("TOTK_PAD_LAYOUT"), "xbox_prompts");
+    if (!patches && want_xbox && xbox_prompts_ready) {
+        xbox[strlen(xbox) - strlen("/manifest.tsv")] = 0;
+        xbox_prompts_active = overlay_load(xbox, 1);
+        if (xbox_prompts_active) rt_log("RomFS overlay: Xbox button prompts (%s)", xbox);
+        else rt_log("RomFS overlay: %s failed its check (run the setup again); romfs-patches loads instead", xbox);
+    } else if (want_xbox) {
+        rt_log("RomFS overlay: pad_layout = xbox_prompts, but %s; Switch prompts stay",
+               wide      ? "the game resolution takes the wide UI layout"
+               : patches ? "TOTK_ROMFS_PATCHES is set"
+                         : "romfs-patches-xbox has no manifest.tsv (run the setup again)");
+    }
+    if (!patches && !xbox_prompts_active && snprintf(def, sizeof def, "%s/romfs-patches/manifest.tsv", index_dir) < (int)sizeof def &&
         plat_file_exists(def)) {
         def[strlen(def) - strlen("/manifest.tsv")] = 0;
         patches = def;
     }
     const char *dirs[2] = {patches, cfg_get("TOTK_ROMFS_MODS")};
     for (int i = 0; i < 2; i++)
-        if (dirs[i] && *dirs[i] && strcmp(dirs[i], "0")) overlay_load(dirs[i]);
+        if (dirs[i] && *dirs[i] && strcmp(dirs[i], "0")) overlay_load(dirs[i], 0);
     heapdef_overlay();
     added_init();
     if (noverlay) qsort(overlays, noverlay, sizeof *overlays, overlay_order);

@@ -19,7 +19,7 @@
 //                                                 starting text (the game's, else the default name)
 //   TOTK_SWKBD_TEST=ok|cancel                     open the window, then press OK / Cancel on the first timer tick
 #ifdef _WIN32
-#include <windows.h>
+#include "platform/platform.h"
 #endif
 #include <stdint.h>
 #include <stdio.h>
@@ -165,7 +165,7 @@ static void finish(Entry *e, int result) {
     e->result = result;
 }
 
-static LRESULT CALLBACK edit_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+static LRESULT CALLBACK edit_proc(HWND h, unsigned m, WPARAM w, LPARAM l) {
     Entry *e = (Entry *)GetWindowLongPtrW(GetParent(h), GWLP_USERDATA);
     if (m == WM_CHAR && w >= 0x20 && !(w >= 0xd800 && w < 0xe000) &&
         !allowed((uint16_t)w, e->req->disabled, e->req->numeric)) {
@@ -175,7 +175,7 @@ static LRESULT CALLBACK edit_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return CallWindowProcW(e->edit_proc, h, m, w, l);
 }
 
-static LRESULT CALLBACK entry_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+static LRESULT CALLBACK entry_proc(HWND h, unsigned m, WPARAM w, LPARAM l) {
     Entry *e = (Entry *)GetWindowLongPtrW(h, GWLP_USERDATA);
     switch (m) {
     case WM_COMMAND:
@@ -200,29 +200,33 @@ static LRESULT CALLBACK entry_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
-static HWND child(HWND parent, const wchar_t *cls, const wchar_t *text, DWORD style, int x, int y, int w, int h, int id,
+static HWND child(HWND parent, const wchar_t *cls, const wchar_t *text, uint32_t style, int x, int y, int w, int h, int id,
                   HFONT font) {
     HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h, parent, (HMENU)(intptr_t)id,
-                             GetModuleHandleW(NULL), NULL);
-    if (c) SendMessageW(c, WM_SETFONT, (WPARAM)font, FALSE);
+                             (void *)(uintptr_t)plat_image_base(), NULL);
+    if (c) SendMessageW(c, WM_SETFONT, (WPARAM)font, 0);
     return c;
 }
 
 // Shows the window and waits for the answer. Returns 1 with the text in out (n units), 0 when cancelled.
 static int text_entry_run(const SwkbdRequest *req, uint16_t *out, size_t cap, size_t *n) {
     static const wchar_t cls[] = L"TotKTextEntry";
-    HINSTANCE inst = GetModuleHandleW(NULL);
+    HINSTANCE inst = (void *)(uintptr_t)plat_image_base();
     WNDCLASSEXW wc = {.cbSize = sizeof wc, .lpfnWndProc = entry_proc, .hInstance = inst,
                       .hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW), .hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1),
                       .lpszClassName = cls};
-    if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
-        rt_fatal("nn::swkbd::ShowKeyboard: RegisterClassEx (error %lu)", GetLastError());
+    if (!RegisterClassExW(&wc) && plat_last_error() != ERROR_CLASS_ALREADY_EXISTS)
+        rt_fatal("nn::swkbd::ShowKeyboard: RegisterClassEx (error %lu)", plat_last_error());
 
     Entry e = {.req = req, .armed = 0};
     const char *test = cfg_get("TOTK_SWKBD_TEST");
     if (test && *test) e.test = !strcmp(test, "cancel") ? -1 : 1;
+    // The process is per-monitor DPI aware: the font and the layout below are measured at the game window's DPI, the
+    // monitor the dialog opens on, not at the system DPI that plain SystemParametersInfo and AdjustWindowRectEx use.
+    HWND owner = gfx_window_handle();
+    unsigned dpi = owner ? GetDpiForWindow(owner) : GetDpiForSystem();
     NONCLIENTMETRICSW ncm = {.cbSize = sizeof ncm};
-    SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof ncm, &ncm, 0);
+    SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof ncm, &ncm, 0, dpi);
     HFONT font = CreateFontIndirectW(&ncm.lfMessageFont);
     HDC dc = GetDC(NULL);
     HGDIOBJ old = SelectObject(dc, font);
@@ -234,10 +238,9 @@ static int text_entry_run(const SwkbdRequest *req, uint16_t *out, size_t cap, si
     int y_prompt = pad, h_prompt = u * 5 / 2, y_edit = y_prompt + h_prompt + u / 4, h_edit = u * 9 / 5;
     int y_hint = y_edit + h_edit + u / 2, y_btn = y_hint + u * 3 / 2, ch = y_btn + bh + pad;
 
-    HWND owner = gfx_window_handle();
     RECT wr = {0, 0, cw + 2 * pad, ch};
-    DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU, ex = WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT;
-    AdjustWindowRectEx(&wr, style, FALSE, ex);
+    uint32_t style = WS_POPUP | WS_CAPTION | WS_SYSMENU, ex = WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT;
+    AdjustWindowRectExForDpi(&wr, style, 0, ex, dpi);
     int ww = wr.right - wr.left, wh = wr.bottom - wr.top, x = CW_USEDEFAULT, y = CW_USEDEFAULT;
     RECT orc;
     if (owner && GetWindowRect(owner, &orc)) {
@@ -247,7 +250,7 @@ static int text_entry_run(const SwkbdRequest *req, uint16_t *out, size_t cap, si
     wchar_t title[128], ok[64], cancel[64], hint[160];
     e.wnd = CreateWindowExW(ex, cls, wide(ui_text(UI_SWKBD_TITLE), title, 128), style, x, y, ww, wh, owner, NULL, inst,
                             NULL);
-    if (!e.wnd) rt_fatal("nn::swkbd::ShowKeyboard: CreateWindowEx (error %lu)", GetLastError());
+    if (!e.wnd) rt_fatal("nn::swkbd::ShowKeyboard: CreateWindowEx (error %lu)", plat_last_error());
     SetWindowLongPtrW(e.wnd, GWLP_USERDATA, (LONG_PTR)&e);
     wchar_t prompt[0x102];
     if (req->prompt[0]) memcpy(prompt, req->prompt, sizeof req->prompt), prompt[0x101] = 0;
@@ -265,7 +268,7 @@ static int text_entry_run(const SwkbdRequest *req, uint16_t *out, size_t cap, si
     SendMessageW(e.edit, EM_LIMITTEXT, (WPARAM)req->max_len, 0);
     e.edit_proc = (WNDPROC)SetWindowLongPtrW(e.edit, GWLP_WNDPROC, (LONG_PTR)edit_proc);
 
-    if (owner) EnableWindow(owner, FALSE);
+    if (owner) EnableWindow(owner, 0);
     ShowWindow(e.wnd, SW_SHOW);
     SetForegroundWindow(e.wnd);
     SetFocus(e.edit);
@@ -274,7 +277,7 @@ static int text_entry_run(const SwkbdRequest *req, uint16_t *out, size_t cap, si
     MSG msg;
     int quit = 0;
     while (!e.result) {
-        BOOL got = GetMessageW(&msg, NULL, 0, 0);
+        int got = GetMessageW(&msg, NULL, 0, 0);
         if (got <= 0) { quit = got == 0; finish(&e, -1); break; }
         if (msg.message == WM_KEYDOWN && (msg.wParam == VK_RETURN || msg.wParam == VK_ESCAPE) &&
             (msg.hwnd == e.wnd || IsChild(e.wnd, msg.hwnd))) {
@@ -287,7 +290,7 @@ static int text_entry_run(const SwkbdRequest *req, uint16_t *out, size_t cap, si
         DispatchMessageW(&msg);
     }
     KillTimer(e.wnd, TIMER_ID);
-    if (owner) EnableWindow(owner, TRUE);   // before the window goes, so activation returns to the game window
+    if (owner) EnableWindow(owner, 1);   // before the window goes, so activation returns to the game window
     DestroyWindow(e.wnd);
     if (owner) SetForegroundWindow(owner);
     DeleteObject(font);

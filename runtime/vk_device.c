@@ -242,6 +242,8 @@ static int create_device(void) {
         CHAIN(lr, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR);
     }
     if (has_ext(ep, ne, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) { g_vk.has_memory_budget = 1; ext[n_ext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME; }
+    // GPU breadcrumbs for a lost device (vk_crumbs.c): AMD's drivers and RADV report it.
+    if (has_ext(ep, ne, VK_AMD_BUFFER_MARKER_EXTENSION_NAME)) { g_vk.has_buffer_marker = 1; ext[n_ext++] = VK_AMD_BUFFER_MARKER_EXTENSION_NAME; }
     // Graphics pipeline library: chained last so it can be dropped again when vk_caps_gpl declines it.
     void **gpl_link = NULL;
     if (has_ext(ep, ne, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) && has_ext(ep, ne, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
@@ -255,6 +257,7 @@ static int create_device(void) {
     // The driver fills the chain with what it supports; the same chain then enables all of it (robustBufferAccess
     // stays on: guest shaders index constant buffers freely and out-of-range reads must stay harmless).
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &c->f2);
+    vk_caps_driver(g_vk.phys);
     vk_caps_features(&c->f2.features);
     if (gpl_link) {
         VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gp = {
@@ -276,6 +279,7 @@ static int create_device(void) {
     else if (!h->geometryShader) miss = "geometryShader";
     else if (!h->textureCompressionBC) miss = "textureCompressionBC";
     if (miss) { rt_log("vk: required feature missing on %s: %s", g_vk.props.deviceName, miss); free(c); return 0; }
+    if (!c->fault.deviceFault) g_vk.has_device_fault = 0;   // vkGetDeviceFaultInfoEXT needs the feature, not just the extension
     g_vk.has_buffer_device_address = c->f12.bufferDeviceAddress;
     g_vk.has_astc_ldr = h->textureCompressionASTC_LDR;
     {
@@ -328,6 +332,7 @@ static int create_device(void) {
         rt_log("vk: timeline semaphore creation failed (%d)", (int)r);
         return 0;
     }
+    vk_crumbs_init(&g_vk);
     return 1;
 }
 
@@ -337,6 +342,7 @@ static void destroy_all(void) {
     gfx_window_release_vk();
     if (g_vk.device) vkDeviceWaitIdle(g_vk.device);
     if (g_vk.device) vk_astc_release();
+    if (g_vk.device) vk_crumbs_release();
     if (g_vk.timeline) vkDestroySemaphore(g_vk.device, g_vk.timeline, NULL);
     vk_headroom_stop();
     if (g_vk.vma) vmaDestroyAllocator(g_vk.vma);
@@ -372,6 +378,65 @@ void vk_shutdown(void) {
 }
 
 VkCtx *vk_ctx(void) { return g_ready ? &g_vk : NULL; }
+
+static const char *fault_address_type(VkDeviceFaultAddressTypeEXT t) {
+    switch (t) {
+    case VK_DEVICE_FAULT_ADDRESS_TYPE_NONE_EXT: return "none";
+    case VK_DEVICE_FAULT_ADDRESS_TYPE_READ_INVALID_EXT: return "read invalid";
+    case VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT: return "write invalid";
+    case VK_DEVICE_FAULT_ADDRESS_TYPE_EXECUTE_INVALID_EXT: return "execute invalid";
+    case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_UNKNOWN_EXT: return "instruction pointer (unknown)";
+    case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_INVALID_EXT: return "instruction pointer (invalid)";
+    case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_FAULT_EXT: return "instruction pointer (fault)";
+    default: return "unknown type";
+    }
+}
+
+// The query runs once per process. Threads that hit the loss at the same time wait on the lock until it is logged, so
+// none of them reaches its rt_fatal and ends the process before the report is written.
+void vk_device_fault_report(VkResult r) {
+    static PlatMutex lock = PLAT_MUTEX_INIT;
+    static int done;
+    if (r != VK_ERROR_DEVICE_LOST) return;
+    plat_mutex_lock(&lock);
+    if (done) { plat_mutex_unlock(&lock); return; }
+    done = 1;
+    vk_crumbs_report();
+    VkCtx *c = vk_ctx();
+    PFN_vkGetDeviceFaultInfoEXT get =
+        c && c->has_device_fault ? (PFN_vkGetDeviceFaultInfoEXT)vkGetDeviceProcAddr(c->device, "vkGetDeviceFaultInfoEXT")
+                                 : NULL;
+    if (!get) {
+        rt_log("vk: device lost; no fault report (VK_EXT_device_fault %s)", c && c->has_device_fault ? "has no entry point"
+                                                                                                    : "not enabled");
+        plat_mutex_unlock(&lock);
+        return;
+    }
+    VkDeviceFaultCountsEXT n = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    VkResult q = get(c->device, &n, NULL);
+    VkDeviceFaultAddressInfoEXT *ai = calloc(n.addressInfoCount + 1, sizeof *ai);
+    VkDeviceFaultVendorInfoEXT *vi = calloc(n.vendorInfoCount + 1, sizeof *vi);
+    VkDeviceFaultInfoEXT info = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT, .pAddressInfos = ai, .pVendorInfos = vi};
+    uint64_t binary = n.vendorBinarySize;
+    n.vendorBinarySize = 0;   // the vendor binary is not fetched; its size alone is logged
+    if (q == VK_SUCCESS && ai && vi) q = get(c->device, &n, &info);
+    if (q != VK_SUCCESS && q != VK_INCOMPLETE) {
+        rt_log("vk: device lost; vkGetDeviceFaultInfoEXT failed (%d)", (int)q);
+    } else {
+        rt_log("vk: device fault: \"%s\" (%u address infos, %u vendor infos, vendor binary %llu bytes)", info.description,
+               n.addressInfoCount, n.vendorInfoCount, (unsigned long long)binary);
+        // The faulting access lies in the precision-aligned range around the reported address.
+        for (uint32_t i = 0; i < n.addressInfoCount; i++)
+            rt_log("vk: device fault address %u: %s at %#llx, precision %#llx", i, fault_address_type(ai[i].addressType),
+                   (unsigned long long)ai[i].reportedAddress, (unsigned long long)ai[i].addressPrecision);
+        for (uint32_t i = 0; i < n.vendorInfoCount; i++)
+            rt_log("vk: device fault vendor info %u: \"%s\" code %#llx data %#llx", i, vi[i].description,
+                   (unsigned long long)vi[i].vendorFaultCode, (unsigned long long)vi[i].vendorFaultData);
+    }
+    free(ai);
+    free(vi);
+    plat_mutex_unlock(&lock);
+}
 
 int vk_selftest(void) {
     if (!vk_init()) return 1;

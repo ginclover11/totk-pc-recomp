@@ -26,6 +26,7 @@
  "phase.prepare.seed": "Reading the shaders from the game data",
  "phase.prepare.translate": "Translating the shaders",
  "phase.prepare.libraries": "Building the shaders for the graphics driver",
+ "phase.prepare.pack": "Packing the shader cache into one file",
  "phase.cleanup.ini": "Writing totk.ini",
  "phase.cleanup.temp": "Removing temporary files",
 
@@ -75,10 +76,13 @@
  "prepare.shader_list_missing": "The shader list is missing.",
  "prepare.romfs_patches_failed": "Writing the game data patches failed (exit code {code}). Details: {log}",
  "prepare.shaders_failed": "Preparing the shaders failed (exit code {code}). Details: {log}",
+ "cleanup.romfs_unreadable": "The game data in {path} is missing or cannot be read after the install. Restart Windows, then run the installer again on the same folder: it extracts the game data again and keeps the rest.",
+ "prepare.pack_failed": "Packing the shader cache failed (exit code {code}). Details: {log}",
  "cleanup.ini_failed": "totk.ini cannot be written: {detail}",
 
  "warn.lang_needs_fonts": "Text in {lang} needs the Switch system fonts, which the installer does not extract; some text may not show.",
  "warn.npdm_differs": "main.npdm differs from the reference {version} dump; only the code modules are used.",
+ "warn.xbox_prompts_failed": "The Xbox button prompts could not be prepared (exit code {code}); the game keeps the Switch prompts. Details: {log}",
 
  "ui.title": "TotK Setup",
  "ui.version": "version {version}",
@@ -166,8 +170,6 @@
  "lang.pt-BR": "Portuguese (Brazil)",
  "lang.ru": "Russian",
  "lang.ko": "Korean",
- "lang.zh-CN": "Chinese (Simplified, China)",
- "lang.zh-TW": "Chinese (Traditional, Taiwan)",
  "lang.zh-Hans": "Chinese (Simplified)",
  "lang.zh-Hant": "Chinese (Traditional)"
 }

@@ -261,11 +261,25 @@ int probe_cfg(void) {
     CHECK((int64_t)st[0] * st[0] + (int64_t)st[1] * st[1] <= 32768ll * 32768, "mouse: clamped to the unit circle");
     input_mouse_stick(30, 0, 1.0 / 60, 0, st);
     CHECK(st[0] == 0 && st[1] == 0, "mouse: sensitivity 0 is off");
+    input_pad_stick(3000, -2000, 0.15f, st);
+    CHECK(st[0] == 0 && st[1] == 0, "pad stick: an 11% drift inside a 15% dead zone reads centred");
+    input_pad_stick(4000, -3000, 0, st);
+    CHECK(st[0] == 4000 && st[1] == -3000, "pad stick: dead zone 0 passes the stick unchanged");
+    input_pad_stick(32767, 0, 0.15f, st);
+    CHECK(st[0] == 32767 && st[1] == 0, "pad stick: full deflection still reaches full");
+    input_pad_stick(-32768, -32768, 0.15f, st);
+    CHECK(st[0] < 0 && st[1] < 0 && st[0] >= -32767 && (int64_t)st[0] * st[0] + (int64_t)st[1] * st[1] <= 32768ll * 32768,
+          "pad stick: a square gate's corner stays on the unit circle");
+    input_pad_stick(0, 32767 / 2 + 1, 0.2f, st);
+    CHECK(abs(st[1] - 32767 * 3 / 8) <= 3, "pad stick: half deflection past a 20% zone is (0.5 - 0.2) / 0.8 of full");
     // Gamepad layouts (input_map.c)
     CHECK(input_pad_layout_pick("auto", 1) == PAD_LAYOUT_NINTENDO && input_pad_layout_pick(NULL, 0) == PAD_LAYOUT_XBOX,
           "pad layout: automatic is Nintendo for an east button labelled A, Xbox otherwise");
     CHECK(input_pad_layout_pick("Xbox", 1) == PAD_LAYOUT_XBOX && input_pad_layout_pick("nintendo", 0) == PAD_LAYOUT_NINTENDO,
           "pad layout: a set layout wins over the labels");
+    CHECK(input_pad_layout_pick("xbox_prompts", 0) == PAD_LAYOUT_NINTENDO &&
+              input_pad_layout_pick("Xbox_Prompts", 1) == PAD_LAYOUT_NINTENDO,
+          "pad layout: Xbox prompts keep the Nintendo positions (only the prompts change, romfs.c overlay_init)");
     uint8_t pd[PAD_COUNT] = {0};
     pd[PAD_SOUTH] = pd[PAD_NORTH] = 1;
     CHECK(input_map_pad_buttons(pd, PAD_LAYOUT_NINTENDO) == (1ull << B_B | 1ull << B_X) &&
@@ -279,6 +293,13 @@ int probe_cfg(void) {
           "pad layout: a bind line adds its physical button in every layout");
     CHECK(input_map_pad_buttons((uint8_t[PAD_COUNT]){[PAD_SOUTH] = 1}, PAD_LAYOUT_XBOX) == 0,
           "pad layout: a bind line replaces the layout's own button");
+    input_map_reset();
+    CHECK(input_map_pad_buttons((uint8_t[PAD_COUNT]){[PAD_RPADDLE1] = 1}, PAD_LAYOUT_XBOX) == 0,
+          "pad layout: a back paddle is unbound by default");
+    CHECK(input_map_bind("ZL", "pad:default, pad:rpaddle1") &&
+              input_map_pad_buttons((uint8_t[PAD_COUNT]){[PAD_RPADDLE1] = 1}, PAD_LAYOUT_NINTENDO) == 1ull << B_ZL &&
+              input_map_pad_buttons((uint8_t[PAD_COUNT]){[PAD_ZL] = 1}, PAD_LAYOUT_NINTENDO) == 1ull << B_ZL,
+          "bind: pad:rpaddle1 adds a back paddle, pad:default keeps the trigger");
     input_map_reset();
     // Bind lines for stick directions and default parts; the remapping rows' edits (input_map.c)
     memset(dn, 0, sizeof dn);

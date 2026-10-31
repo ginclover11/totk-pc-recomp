@@ -18,6 +18,11 @@
 // (64 hex digits) overrides it. A translator change therefore changes every cache key without a hand-made KEY_VERSION
 // bump; KEY_VERSION is for changes on this side (key layout, how the output is used).
 //
+// Pack: tools/pack_shader_cache.py folds the .spv, .res.json, .use and in/*.in files into <cache>/shader-cache.pack
+// (one file instead of four per shader: ~117,000 files after an install) and deletes them; the installer runs it after
+// preparing the shaders. The pack is read-only here. Every read looks in the pack first and then for the loose file,
+// and new translations are written as loose files as before, until the tool runs again (section "cache pack").
+//
 // Stored inputs: every translation also writes <cache>/in/<input id>.in (magic "TKSI"; stage, the full answers, the
 // control section, the code up to its length, c1), so a pipeline key record (vk_pipeline.c), which names its shaders by
 // input id, can be translated again under a new translator without guest memory (gfx_shader_load_input,
@@ -124,6 +129,88 @@ static PlatOnce paths_once = PLAT_ONCE_INIT;
 #define read_file plat_file_read
 #define write_file plat_file_write
 
+// ---- cache pack (<cache>/shader-cache.pack, written by tools/pack_shader_cache.py)
+// Little-endian: "TKSPACK1", u32 count, u32 0, then count entries sorted by (kind, name), then the data. name is the
+// 32 bytes the loose file's 64 hex digits spell. The index is read once (48 bytes a file: ~5.6 MB after an install);
+// the data is read per lookup with positioned reads on one handle, safe from every thread. A pack that fails a check is
+// ignored as a whole and the loose files are used.
+enum { PACK_SPV = 1, PACK_RES = 2, PACK_USE = 3, PACK_IN = 4 };
+typedef struct { uint8_t name[32]; uint32_t kind, size; uint64_t offset; } PackEnt;
+_Static_assert(sizeof(PackEnt) == 48, "shader-cache.pack entry layout");
+static PlatFile *pack_file;
+static PackEnt *pack_ix;
+static uint32_t pack_n;
+
+static int pack_cmp(const PackEnt *a, uint32_t kind, const uint8_t name[32]) {
+    if (a->kind != kind) return a->kind < kind ? -1 : 1;
+    return memcmp(a->name, name, 32);
+}
+
+static int pack_read_at(uint64_t offset, void *out, uint32_t n) {
+    return plat_file_pread(pack_file, out, n, offset) == (int64_t)n;
+}
+
+// Opens <cache>/shader-cache.pack and reads its index (init_paths). Nothing happens when there is none.
+static void pack_open(void) {
+    char p[PATH_CAP + 32];
+    snprintf(p, sizeof p, "%s" PLAT_SEP "shader-cache.pack", cache_dir);
+    PlatFile *h = plat_file_open(p, PLAT_FILE_READ);
+    if (!h) return;
+    uint8_t head[16];
+    uint32_t n = 0;
+    const char *why = NULL;
+    PackEnt *ix = NULL;
+    pack_file = h;
+    int64_t size = plat_file_handle_size(h);
+    if (size < 0 || !pack_read_at(0, head, sizeof head) || memcmp(head, "TKSPACK1", 8)) why = "header";
+    if (!why) {
+        memcpy(&n, head + 8, 4);
+        if (n > (1u << 24) || (uint64_t)n * sizeof *ix + sizeof head > (uint64_t)size ||
+            !(ix = malloc((size_t)n * sizeof *ix + 1)))
+            why = "index size";
+        else if (!pack_read_at(sizeof head, ix, n * (uint32_t)sizeof *ix)) why = "index read";
+    }
+    for (uint32_t i = 0; !why && i < n; i++) {
+        if (ix[i].offset + ix[i].size > (uint64_t)size) why = "entry out of bounds";
+        else if (i && pack_cmp(&ix[i - 1], ix[i].kind, ix[i].name) >= 0) why = "index order";
+    }
+    if (why) {
+        rt_log("gfx_shader: %s is not a usable cache pack (%s); reading the loose files", p, why);
+        free(ix);
+        plat_file_close(h);
+        pack_file = NULL;
+        return;
+    }
+    pack_ix = ix, pack_n = n;
+    rt_log("gfx_shader: cache pack %s: %u files", p, n);
+}
+
+static const PackEnt *pack_find(uint32_t kind, const uint8_t name[32]) {
+    size_t lo = 0, hi = pack_n;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int c = pack_cmp(&pack_ix[mid], kind, name);
+        if (!c) return &pack_ix[mid];
+        if (c < 0) lo = mid + 1;
+        else hi = mid;
+    }
+    return NULL;
+}
+
+// A packed file as plat_file_read returns a loose one: malloc'd, NUL after the last byte; NULL when absent or empty.
+static uint8_t *pack_read(uint32_t kind, const uint8_t name[32], uint64_t *size) {
+    const PackEnt *e = pack_find(kind, name);
+    uint8_t *buf = e && e->size ? malloc((size_t)e->size + 1) : NULL;
+    if (!buf) return NULL;
+    if (!pack_read_at(e->offset, buf, e->size)) {
+        free(buf);
+        return NULL;
+    }
+    buf[e->size] = 0;
+    *size = e->size;
+    return buf;
+}
+
 // Appends a UTF-8 string as a JSON string body: ASCII as is, quotes and backslashes escaped, the rest as \uXXXX
 // (UTF-16 units), so the service's stdin encoding does not matter.
 static void json_esc(char **o, const char *s) {
@@ -216,6 +303,7 @@ static void init_paths(void) {
     if (cache_cfg && *cache_cfg && strlen(cache_cfg) < sizeof cache_dir) strcpy(cache_dir, cache_cfg);
     else if (exe_dir[0]) snprintf(cache_dir, sizeof cache_dir, "%s" PLAT_SEP "shader-cache", exe_dir);
     xlate_identity();
+    if (cache_dir[0]) pack_open();
     use_preload_start();
 }
 
@@ -465,15 +553,15 @@ static int spirv_complete(const uint32_t *w, uint64_t n) {
     return i == n;
 }
 
-// Reads <key>.spv and <key>.res.json; NULL if either is missing or malformed (the caller translates again and
-// overwrites both). iid: the input id, NULL when the caller sets it.
-static GfxShader *disk_load(const uint8_t key[32], const uint8_t *iid) {
+// Reads <key>.spv and <key>.res.json from the pack (packed 1) or the loose files; NULL if either is missing or
+// malformed. iid: the input id, NULL when the caller sets it.
+static GfxShader *disk_load_from(const uint8_t key[32], const uint8_t *iid, int packed) {
     static volatile int32_t n_bad;
     char hex[65], p[PATH_CAP + 80];
     key_hex(key, hex);
     uint64_t spv_size = 0, res_size = 0;
     snprintf(p, PATH_CAP + 80, "%s" PLAT_SEP "%s.res.json", cache_dir, hex);
-    uint8_t *res = read_file(p, &res_size);
+    uint8_t *res = packed ? pack_read(PACK_RES, key, &res_size) : read_file(p, &res_size);
     if (!res) return NULL;
     if (!reflection_valid((const char *)res, res_size)) {
         int32_t n = __atomic_add_fetch(&n_bad, 1, __ATOMIC_SEQ_CST);
@@ -482,7 +570,7 @@ static GfxShader *disk_load(const uint8_t key[32], const uint8_t *iid) {
         return NULL;
     }
     snprintf(p, PATH_CAP + 80, "%s" PLAT_SEP "%s.spv", cache_dir, hex);
-    uint8_t *spv = read_file(p, &spv_size);
+    uint8_t *spv = packed ? pack_read(PACK_SPV, key, &spv_size) : read_file(p, &spv_size);
     uint32_t magic = 0;
     if (spv && spv_size >= 20) memcpy(&magic, spv, 4);
     if (!spv || spv_size % 4 || magic != 0x07230203 || !spirv_complete((const uint32_t *)spv, spv_size / 4)) {
@@ -498,6 +586,13 @@ static GfxShader *disk_load(const uint8_t key[32], const uint8_t *iid) {
     s->reflection_size = res_size;
     reflect(s);
     return s;
+}
+
+// The pack, then the loose files (a newer translation of a key the pack holds a bad copy of); NULL when neither has a
+// valid pair (the caller translates again and writes loose files).
+static GfxShader *disk_load(const uint8_t key[32], const uint8_t *iid) {
+    GfxShader *s = pack_n ? disk_load_from(key, iid, 1) : NULL;
+    return s ? s : disk_load_from(key, iid, 0);
 }
 
 // ---- request building
@@ -748,9 +843,24 @@ static void use_preload(void *arg) {
     (void)arg;
     uint64_t t0 = plat_now_ns();
     char p[PATH_CAP + 80];
+    int n = 0, bad = 0;
+    for (uint32_t i = 0; i < pack_n; i++) {   // the packed masks; the loose files below add the masks found since
+        uint32_t u[5];
+        UseFile **slot, *x;
+        if (pack_ix[i].kind != PACK_USE) continue;
+        if (pack_ix[i].size != sizeof u || !pack_read_at(pack_ix[i].offset, u, sizeof u) || u[0] != USE_MAGIC ||
+            u[1] != USE_VERSION) {
+            bad++;
+            continue;
+        }
+        if (!*(slot = use_file_slot(pack_ix[i].name)) && (x = malloc(sizeof *x))) {
+            memcpy(x->name, pack_ix[i].name, 32);
+            x->next = NULL, x->m.slots = u[2], x->m.attrs = u[3], x->m.fouts = u[4];
+            *slot = x, n++;
+        }
+    }
     PlatDir *f = plat_dir_open(cache_dir);
     PlatDirEntry fd;
-    int n = 0, bad = 0;
     if (f) {
         while (plat_dir_next(f, &fd)) {
             size_t name_len = strlen(fd.name);
@@ -821,7 +931,8 @@ static int use_find(const uint8_t h[32], UseMask *m) {
         char p[PATH_CAP + 80];
         use_path_of(name, p);
         uint64_t n = 0;
-        uint32_t *f = (uint32_t *)read_file(p, &n);
+        uint32_t *f = (uint32_t *)pack_read(PACK_USE, name, &n);
+        if (!f) f = (uint32_t *)read_file(p, &n);
         known = f && n == 20 && f[0] == USE_MAGIC && f[1] == USE_VERSION;
         if (known) m->slots = f[2], m->attrs = f[3], m->fouts = f[4];
         free(f);
@@ -1102,7 +1213,7 @@ static void in_store(const uint8_t iid[32], int stage, const uint8_t *control, c
                      const GfxShaderAnswers *a) {
     char p[PATH_CAP + 80], tmp[PATH_CAP + 120];
     in_path(iid, p);
-    if (file_exists(p)) return;
+    if (pack_find(PACK_IN, iid) || file_exists(p)) return;
     GfxShaderAnswers zero = {0};
     InHeader h = {IN_MAGIC, IN_VERSION, (uint32_t)stage, r->length, r->c1_len, sizeof(GfxShaderAnswers)};
     size_t n = sizeof h + sizeof zero + CONTROL_SIZE + r->length + r->c1_len;
@@ -1124,7 +1235,8 @@ static int in_load(const uint8_t iid[32], Inputs *in) {
     char p[PATH_CAP + 80];
     in_path(iid, p);
     uint64_t n = 0;
-    uint8_t *f = read_file(p, &n);
+    uint8_t *f = pack_read(PACK_IN, iid, &n);
+    if (!f) f = read_file(p, &n);
     InHeader h;
     if (!f || n < sizeof h) return free(f), 0;
     memcpy(&h, f, sizeof h);
@@ -1421,7 +1533,7 @@ static void warm_worker(void *arg) {
             key_of_input(iid, key);
             key_hex(key, hex);
             snprintf(p, PATH_CAP + 80, "%s" PLAT_SEP "%s.spv", cache_dir, hex);
-            if (file_exists(p)) __atomic_add_fetch(&w->other_cached, 1, __ATOMIC_SEQ_CST);
+            if (pack_find(PACK_SPV, key) || file_exists(p)) __atomic_add_fetch(&w->other_cached, 1, __ATOMIC_SEQ_CST);
             else gfx_shader_load_input(iid, 1);
         }
         __atomic_add_fetch(&w->done, 1, __ATOMIC_SEQ_CST);
@@ -1459,7 +1571,14 @@ static size_t other_inputs(const uint8_t (*named)[32], size_t n_named, uint8_t (
     char dir[PATH_CAP + 80];
     snprintf(dir, sizeof dir, "%s" PLAT_SEP "in", cache_dir);
     InList l = {.named = named, .n_named = n_named};
-    plat_file_list(dir, ".in", in_collect, &l);
+    char name[68];
+    for (uint32_t i = 0; i < pack_n; i++) {   // the packed inputs, under the name their loose file would have
+        if (pack_ix[i].kind != PACK_IN) continue;
+        key_hex(pack_ix[i].name, name);
+        memcpy(name + 64, ".in", 4);
+        if (!in_collect(name, &l)) break;
+    }
+    plat_file_list(dir, ".in", in_collect, &l);   // in_store writes no loose file for a packed input: no duplicates
     return *out = l.v, l.n;
 }
 

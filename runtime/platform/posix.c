@@ -469,6 +469,7 @@ PlatEvent *plat_event_new(int manual, int initially_set) {
 void plat_event_free(PlatEvent *e) { free(e); }
 
 void plat_event_set(PlatEvent *e) {
+    if (!e) return;   // as SetEvent fails on a null handle: callers may set an event that was never made
     atomic_store(&e->set, 1);
     futex(&e->set, FUTEX_WAKE, e->manual ? INT_MAX : 1, NULL);
 }
@@ -908,6 +909,23 @@ uint64_t plat_rss(void) {
         fclose(f);
     }
     return rss * PAGE;
+}
+
+// What the kernel has promised the process and the system, and its limit, from /proc: the nearest to Windows' commit charge.
+void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb) {
+    *proc_mb = *used_mb = *limit_mb = -1;
+    char line[128];
+    unsigned long long kb;
+    FILE *f = fopen("/proc/meminfo", "r");
+    while (f && fgets(line, sizeof line, f)) {
+        if (sscanf(line, "Committed_AS: %llu", &kb) == 1) *used_mb = (double)kb / 1024;
+        if (sscanf(line, "CommitLimit: %llu", &kb) == 1) *limit_mb = (double)kb / 1024;
+    }
+    if (f) fclose(f);
+    f = fopen("/proc/self/status", "r");
+    while (f && fgets(line, sizeof line, f))
+        if (sscanf(line, "VmData: %llu", &kb) == 1) *proc_mb = (double)kb / 1024;
+    if (f) fclose(f);
 }
 
 uint64_t plat_peak_rss(void) {

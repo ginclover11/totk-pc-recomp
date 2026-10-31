@@ -1231,6 +1231,18 @@ void plat_mem_info(float *used_mb, float *total_mb, float *proc_mb) {
     if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)) *proc_mb = (float)(pmc.WorkingSetSize >> 20);
 }
 
+void plat_commit_info(double *proc_mb, double *used_mb, double *limit_mb) {
+    *proc_mb = *used_mb = *limit_mb = -1;
+    MEMORYSTATUSEX ms = {.dwLength = sizeof ms};
+    if (GlobalMemoryStatusEx(&ms)) {
+        *limit_mb = (double)(ms.ullTotalPageFile >> 20);
+        *used_mb = (double)((ms.ullTotalPageFile - ms.ullAvailPageFile) >> 20);
+    }
+    PROCESS_MEMORY_COUNTERS_EX pmc;
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pmc, sizeof pmc))
+        *proc_mb = (double)(pmc.PrivateUsage >> 20);
+}
+
 // ---- child processes
 
 struct PlatChild {

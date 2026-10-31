@@ -759,7 +759,9 @@ static void probe_sdk_client(Cpu *c) {
     double period = (double)(t1 - t0) / (PROBE_FRAMES - 1) / 1e6;
     printf("sdk: %d x WaitSystemEvent + RequestUpdateAudioRenderer: %d failed, mean period %.3f ms, elapsed frames "
            "%d -> %d\n", PROBE_FRAMES, bad, period, f0, f1);
-    CHECK(!bad && period > 4.5 && period < 5.5 && f1 - f0 >= PROBE_FRAMES - 4 && f1 - f0 <= PROBE_FRAMES + 2,
+    // Over the waits: the blocks that first fill the output ring come at once, up to two device periods of them (PipeWire's
+    // 1024 frames make about 9).
+    CHECK(!bad && period > 4.5 && period < 5.5 && f1 - f0 >= PROBE_FRAMES - 4 && f1 - f0 <= PROBE_FRAMES + 10,
           "SDK render loop");
     rt_call(c, stub(SYM_STOP), 2, handle[0], handle[1]);
     rt_call(c, stub(SYM_CLOSE), 2, handle[0], handle[1]);

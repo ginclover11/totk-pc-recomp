@@ -1653,6 +1653,7 @@ VkCommandBuffer vk_upload_begin(void) {
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     vkBeginCommandBuffer(open_b.cb, &bi);
     open_b.seq = ++next_seq;
+    vk_crumb(open_b.cb, VK_CRUMB_UPLOAD, open_b.seq);
     open_active = 1;
     return open_b.cb;
 }
@@ -1713,12 +1714,16 @@ uint64_t vk_upload_flush(int wait) {
     uint64_t seq = next_seq;
     if (c && open_active) {
         for (int i = 0; i < open_b.nstg; i++) vmaFlushAllocation(c->vma, open_b.stg[i].alloc, 0, VK_WHOLE_SIZE);
+        vk_crumb(open_b.cb, VK_CRUMB_UPLOAD_END, open_b.seq);
         vkEndCommandBuffer(open_b.cb);
         VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &open_b.cb};
         vk_queue_lock();
         VkResult r = vkQueueSubmit(c->gfx_queue, 1, &si, open_b.fence);
         vk_queue_unlock();
-        if (r != VK_SUCCESS) rt_fatal("vk: upload submit failed (%d)", (int)r);
+        if (r != VK_SUCCESS) {
+            vk_device_fault_report(r);
+            rt_fatal("vk: upload submit failed (%d)", (int)r);
+        }
         if (ninflight == cap_inflight) grow((void **)&inflight, &cap_inflight, sizeof *inflight);
         inflight[ninflight++] = open_b;
         open_active = 0;

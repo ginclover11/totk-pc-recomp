@@ -45,7 +45,7 @@ static const char *const action_names[ACTION_COUNT] = {
     "LSTICK_LEFT", "LSTICK_UP", "LSTICK_RIGHT", "LSTICK_DOWN", "RSTICK_LEFT", "RSTICK_UP", "RSTICK_RIGHT", "RSTICK_DOWN"};
 static const char *const pad_names[PAD_COUNT] = {
     NULL, "south", "east", "west", "north", "lstick", "rstick", "l", "r", "start", "back",
-    "dpad_left", "dpad_up", "dpad_right", "dpad_down", "zl", "zr"};
+    "dpad_left", "dpad_up", "dpad_right", "dpad_down", "zl", "zr", "lpaddle1", "rpaddle1", "lpaddle2", "rpaddle2"};
 static const char *const key_names[KEY_COUNT] = {   // each group starts at its id; the ids of a group are consecutive
     [KEY_A] = "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u",
     "v", "w", "x", "y", "z",
@@ -284,7 +284,7 @@ void input_map_line(const InputMap *m, int action, char *out, size_t n) {
 }
 
 int input_pad_layout_pick(const char *setting, int east_labelled_a) {
-    if (setting && !strcasecmp(setting, "nintendo")) return PAD_LAYOUT_NINTENDO;
+    if (setting && (!strcasecmp(setting, "nintendo") || !strcasecmp(setting, "xbox_prompts"))) return PAD_LAYOUT_NINTENDO;
     if (setting && !strcasecmp(setting, "xbox")) return PAD_LAYOUT_XBOX;
     return east_labelled_a ? PAD_LAYOUT_NINTENDO : PAD_LAYOUT_XBOX;
 }
@@ -324,6 +324,15 @@ void input_mouse_stick(int32_t dx, int32_t dy, double dt_s, float sens, int32_t 
     if (len > STICK_MAX) { x *= STICK_MAX / len; y *= STICK_MAX / len; }
     out[0] = (int32_t)lrint(x);
     out[1] = (int32_t)lrint(y);
+}
+
+void input_pad_stick(int32_t x, int32_t y, float dead, int32_t out[2]) {
+    double fx = x / (double)STICK_MAX, fy = y / (double)STICK_MAX, m = sqrt(fx * fx + fy * fy);
+    out[0] = out[1] = 0;
+    if (m <= dead) return;
+    double k = ((m > 1 ? 1 : m) - dead) / (1 - dead) / m;   // past the edge (a square gate's corner) the length is 1
+    out[0] = (int32_t)lrint(fmax(-1, fmin(1, fx * k)) * STICK_MAX);
+    out[1] = (int32_t)lrint(fmax(-1, fmin(1, fy * k)) * STICK_MAX);
 }
 
 // Minus and Plus held together open or close the menu. *held: latched from the poll where both go down until neither is

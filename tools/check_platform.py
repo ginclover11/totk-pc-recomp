@@ -17,6 +17,7 @@ from pathlib import Path
 ALLOWED = {
     "gfx_window_win.c": "window",
     "gfx_window_probe_win.c": "probe",
+    "dpi_probe_win.c": "probe",
     "input_win.c": "keyboard, mouse and cursor",
     "prof_win.c": "profiler",
     "rdoc_win.c": "RenderDoc loader",
