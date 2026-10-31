@@ -156,10 +156,11 @@ to `build\<ver>\shaders\` and runs it through the translator and `spirv-val`; fa
 
 ## Linux
 
-What works today: the extraction, the lifter, the translator and the build all run on Linux, and the game boots to its
-first NVN call (`--boot` with `TOTK_GPU=null`). There is no window, input or audio output yet (`gfx_window_posix.c` and
-`input_posix.c` are stand-ins), so the game does not reach the screen. `tools/run_game.py`, `tools/package_build.py`,
-`tools/build_shaders.py` and the installer still expect Windows.
+The extraction, the lifter, the translator and the build all run on Linux, and the game runs and renders, on SDL3 with
+its Wayland backend. Still missing: the sampling profiler and the frame timing lines (`prof_posix.c`), GPU load in the
+performance overlay, the text entry window (`swkbd.c` accepts the starting text, so a horse keeps its default name), the F8
+trigger of the flight recorder. `tools/run_game.py`, `tools/package_build.py`, `tools/build_shaders.py` and the installer
+still expect Windows. `--probe-shader` and `--probe-vkexec` look for `build/v121/shaders`, whichever version is built.
 
 Verified on CachyOS with kernel 7.3, Clang and LLD 23, and an NVIDIA RTX 5060 on driver 615. The memory tracking needs
 kernel 6.7 or later (`PAGEMAP_SCAN`).
@@ -194,10 +195,11 @@ With the game, after writing `config.local.toml` as in step 2 above:
 .venv/bin/python tools/build_game.py --version v143
 build/v143/totk --selftest
 TOTK_GPU=null build/v143/totk --boot
+build/v143/totk                          # play; settings in build/v143/totk.ini
 ```
 
 `--probe-loader`, `--probe-kernel`, `--probe-ipc`, `--probe-services`, `--probe-fs`, `--probe-gfx-abi`, `--probe-cfg`,
-`--probe-astc` and `--probe-movie` run the same way. The window cases of `--probe-services` are Windows only. The Unicorn
+`--probe-astc` and `--probe-movie` run the same way. The window cases of `--probe-services` are Windows only, and `--probe-window` only opens the window. The Unicorn
 checks of [Checks](#checks) run with `.venv/bin/python`; pass `--exefs build/extracted/v143/exefs` to those that take game
 files. `tests/excl_mt.py` reports ABA failures on both systems: `cpu.h` emulates the exclusive monitor with
 compare-and-swap, which cannot see them.

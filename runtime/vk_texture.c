@@ -172,7 +172,6 @@ static int tex_mirrored(const tex_t *t) {
     return 1;
 }
 
-static void log_limited(volatile long *n, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void log_limited(volatile long *n, const char *fmt, ...) {
     if (__atomic_add_fetch(n, 1, __ATOMIC_SEQ_CST) > 16) return;
     char buf[512];
@@ -213,14 +212,29 @@ static int format_compressed(VkFormat f) {   // vkCmdClearColorImage takes no bl
            (f >= VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK && f <= VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK);
 }
 
+static void log_limited(volatile long *n, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static int bind_pool_memory(VkCtx *c, Tex *e, VkImage img) {
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(c->device, img, &req);
     VkMemSpan sp;
-    if (!vk_mem_resolve(e->pub.addr, req.size, &sp) || !sp.alloc || sp.alloc_offset % req.alignment) return 0;
+    static volatile long n_why;
+    if (!vk_mem_resolve(e->pub.addr, req.size, &sp) || !sp.alloc) {
+        log_limited(&n_why, "texture %#llx: no contiguous pool allocation for %#llx bytes", (unsigned long long)e->pub.addr,
+                    (unsigned long long)req.size);
+        return 0;
+    }
+    if (sp.alloc_offset % req.alignment) {
+        log_limited(&n_why, "texture %#llx: offset %#llx in its pool is not aligned to the image's %#llx",
+                    (unsigned long long)e->pub.addr, (unsigned long long)sp.alloc_offset, (unsigned long long)req.alignment);
+        return 0;
+    }
     VmaAllocationInfo info;
     vmaGetAllocationInfo(c->vma, sp.alloc, &info);
-    if (!(req.memoryTypeBits >> info.memoryType & 1)) return 0;
+    if (!(req.memoryTypeBits >> info.memoryType & 1)) {
+        log_limited(&n_why, "texture %#llx: the image takes memory types %#x, the pool is type %u",
+                    (unsigned long long)e->pub.addr, req.memoryTypeBits, info.memoryType);
+        return 0;
+    }
     if (vmaBindImageMemory2(c->vma, sp.alloc, sp.alloc_offset, img, NULL) != VK_SUCCESS) return 0;
     e->bound_to = sp.alloc;
     return 1;

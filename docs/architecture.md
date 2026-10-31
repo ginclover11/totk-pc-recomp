@@ -49,7 +49,7 @@ MacNativeGames cannot run on x86-64 as is: its CPU path executes ARM64 code nati
 
 - Portable C from MacNativeGames: threads and synchronisation, IPC, memory services, fs/RomFS, time, account, applet, audio renderer and effects. The Apple pieces (mach VM, CommonCrypto, AudioToolbox, GameController) are replaced with Win32 and SDL3.
 - SDK boundary at the `nn::*` function level, matching MacNativeGames. Only `audren:u` and `sm:` are real IPC services.
-- Window, keyboard and mouse: Win32 (`gfx_window_win.c`, `input_win.c`); on Linux, stand-ins so far (`gfx_window_posix.c`, `input_posix.c`). Gamepad and audio output: SDL3. Voice: libopus (BSD). Movies: the SDK's `movie::Decoder` is replaced by a host VP9 decoder over libvpx (BSD, static; `runtime/ov_movie.c`), because FFmpeg from MSYS2 is a GPL build.
+- Window, keyboard and mouse: Win32 (`gfx_window_win.c`, `input_win.c`), SDL3 on Linux (`gfx_window_posix.c`, `input_posix.c`). Swapchain, present and vsync (`gfx_present.c`) and the gamepad, scripts and bindings (`input.c`) are shared. Gamepad and audio output: SDL3. Voice: libopus (BSD). Movies: the SDK's `movie::Decoder` is replaced by a host VP9 decoder over libvpx (BSD, static; `runtime/ov_movie.c`), because FFmpeg from MSYS2 is a GPL build.
 - zstd: most RomFS files of 1.4.3 are zstd frames. The patch set `zstd` sends the game's two decoder entry points to
   libzstd on the host (`ov_zstd.c`, `TOTK_ZSTD_NATIVE`); the lifted decoder took almost three times as long.
 - Settings and menu: every key with its default is in one table (`cfg.c`), read from `totk.ini` and `TOTK_*`

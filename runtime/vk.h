@@ -75,7 +75,7 @@ int vk_init(void);                          // idempotent; 1 on success, 0 on fa
 void vk_shutdown(void);
 int vk_selftest(void);                      // 0 on success
 
-// ---- window and present (gfx_window.c). Host threads only.
+// ---- window and present (gfx_present.c). Host threads only.
 // vk_present_image: blits the crop rectangle {x, y, w, h} of src (NULL, or w/h <= 0: the whole w x h image), scaled
 // to the swapchain extent, into the acquired swapchain image and presents it. src is in layout, which is
 // VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL (its writes made visible to the transfer stage by the caller's barrier) or

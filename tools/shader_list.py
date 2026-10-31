@@ -16,8 +16,10 @@ def git(repo, *args):
     return subprocess.run(['git', '-C', str(repo), *args], check=True, capture_output=True, encoding='utf-8').stdout
 
 
-def history(repo, rev='origin/HEAD'):
-    """rev's list, then each V row of an older revision that no newer one has, newest first."""
+def history(repo, rev='HEAD'):
+    """rev's list, then each V row of an older revision that no newer one has, newest first. By default the commit
+    tools/fetch_refs.sh pins, as a newer list may have another format. fetch_refs.sh clones without history; this needs
+    it: git -C refs/MacNativeGames fetch --unshallow origin"""
     lines = git(repo, 'show', f'{rev}:{PATH}').splitlines()
     seen = set(lines)
     for h in git(repo, 'log', '--format=%H', rev, '--', PATH).split()[1:]:

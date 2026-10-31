@@ -16,7 +16,7 @@ const OvNvState *ov_nv_state(void);                        // ov_gfx.c
 #define RT_GPU_VA_BASE 0x8000000000ull                     // 2^39, never mapped on the host
 #define RT_GPU_VA_SIZE (64ull << 30)
 
-// ---- window, vsync, focus (gfx_window.c, vk_device.c). Host threads only; never run guest code.
+// ---- window, vsync, focus (gfx_present.c, gfx_window_win.c, gfx_window_posix.c, vk_device.c). Host threads only; never run guest code.
 void gfx_window_start(void);                               // window thread, Vulkan device, swapchain; idempotent
 void gfx_vsync_bind(uint64_t system_event);                // nn::vi vsync event; signalled at 60 Hz
 uint64_t gfx_vsync_ticks(void);                            // ticks since start
