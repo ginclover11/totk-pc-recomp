@@ -23,9 +23,9 @@ jobs:
       - uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
-          location: C:\
+          release: false   # the runner's own MSYS2 in C:\msys64, where tools/build_game.py looks
           install: >-
-            mingw-w64-ucrt-x86_64-clang mingw-w64-ucrt-x86_64-lld mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-clang mingw-w64-ucrt-x86_64-lld mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-sdl3 mingw-w64-ucrt-x86_64-opus mingw-w64-ucrt-x86_64-libvpx
             mingw-w64-ucrt-x86_64-zstd mingw-w64-ucrt-x86_64-vulkan-devel
             mingw-w64-ucrt-x86_64-vulkan-memory-allocator mingw-w64-ucrt-x86_64-llvm-tools
