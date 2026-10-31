@@ -92,10 +92,17 @@ typedef struct { const char *name; GuestFn fn; } RtHostEntry;
 #define RT_CAT2(a, b) a##b
 #define RT_CAT(a, b) RT_CAT2(a, b)
 // File-scope declarations; fn must be declared before. The loader binds them by symbol name.
+#ifdef _WIN32
+#define RT_OVR_SECTION ".ovr$m"
+#define RT_OBS_SECTION ".obs$m"
+#else
+#define RT_OVR_SECTION "rt_ovr"   // ELF: the linker defines __start_ and __stop_ for a section with a C identifier name
+#define RT_OBS_SECTION "rt_obs"
+#endif
 #define HOST_OVERRIDE(sym, fn) /* replaces sym in every GOT/GLOB_DAT/ABS64 of every module */                  \
-    __attribute__((used, section(".ovr$m"))) static const RtHostEntry RT_CAT(rt_ovr_, __COUNTER__) = {sym, fn}
+    __attribute__((used, section(RT_OVR_SECTION))) static const RtHostEntry RT_CAT(rt_ovr_, __COUNTER__) = {sym, fn}
 #define HOST_OBSERVER(sym, fn) /* JUMP_SLOT only; fn calls rt_original(c) */                                    \
-    __attribute__((used, section(".obs$m"))) static const RtHostEntry RT_CAT(rt_obs_, __COUNTER__) = {sym, fn}
+    __attribute__((used, section(RT_OBS_SECTION))) static const RtHostEntry RT_CAT(rt_obs_, __COUNTER__) = {sym, fn}
 uint64_t hostfn_register(const char *name, GuestFn fn);    // synthetic address; before hostfn_seal only. The same
                                                            // (name, fn) pair returns the same address
 GuestFn hostfn_override(const char *name);                 // NULL if none
@@ -285,6 +292,8 @@ int probe_loader(void), probe_kernel(void), probe_ipc(void), probe_services(void
 int probe_gfx_abi(void);                                   // gfx_abi_probe.c
 int probe_vkdevice(void);                                 // vk_device.c
 int probe_nvn(void), probe_nvn_tex(void);                  // nvn_probe.c, nvn_tex_probe.c
+int probe_platform(void);                                  // platform_probe.c
+int probe_preempt(void);                                   // kernel.c
 int probe_window(void);                                    // gfx_window.c
 int probe_shader(void);                                    // gfx_shader.c
 int probe_vkmem(void), probe_vkexec(void), probe_astc(void);                 // tex_probe.c, vk_exec_probe.c, astc_probe.c

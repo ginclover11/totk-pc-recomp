@@ -3,7 +3,7 @@
 // PLT stub for nn::os::GetSystemTick, through the lifted sdk function, to rt_ticks.
 //
 // Every probe thread is created with SVC 0x08 and drives the kernel through rt_svc, the entry the lifted code uses.
-#include <windows.h>
+#include "platform/platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -114,7 +114,7 @@ static volatile uint32_t g_lockw __attribute__((aligned(8))), g_keyw __attribute
 static volatile long g_order_n;
 static int g_order[8];
 
-static void record(int idx) { g_order[InterlockedIncrement(&g_order_n) - 1] = idx; }
+static void record(int idx) { g_order[__atomic_add_fetch(&g_order_n, 1, __ATOMIC_SEQ_CST) - 1] = idx; }
 
 static void lock_waiter(Cpu *c) {
     LockJob *j = arg_p(c, 0);
@@ -393,13 +393,13 @@ static volatile long g_running, g_run_max, g_core_use[3], g_core_clash;
 static void core_worker(Cpu *c) {
     for (int i = 0; i < CORE_RUNS; i++) {
         uint32_t core = sv(c, 0x10, 0, 0, 0, 0);
-        if (core > 2 || InterlockedIncrement(&g_core_use[core > 2 ? 0 : core]) != 1) InterlockedIncrement(&g_core_clash);
-        long n = InterlockedIncrement(&g_running), m;
-        while (n > (m = g_run_max) && InterlockedCompareExchange(&g_run_max, n, m) != m) {}
+        if (core > 2 || __atomic_add_fetch(&g_core_use[core > 2 ? 0 : core], 1, __ATOMIC_SEQ_CST) != 1) __atomic_add_fetch(&g_core_clash, 1, __ATOMIC_SEQ_CST);
+        long n = __atomic_add_fetch(&g_running, 1, __ATOMIC_SEQ_CST), m;
+        while (n > (m = g_run_max) && __sync_val_compare_and_swap(&g_run_max, m, n) != m) {}
         uint64_t until = kern_now_ns() + 20000;
         while (kern_now_ns() < until) {}
-        InterlockedDecrement(&g_running);
-        InterlockedDecrement(&g_core_use[core > 2 ? 0 : core]);
+        __atomic_sub_fetch(&g_running, 1, __ATOMIC_SEQ_CST);
+        __atomic_sub_fetch(&g_core_use[core > 2 ? 0 : core], 1, __ATOMIC_SEQ_CST);
         sv(c, 0x0B, i % 8 == 7 ? 50000 : 0, 0, 0, 0);
     }
     exit_thread(c);
@@ -416,10 +416,10 @@ static void test_cores(Cpu *c) {
     for (int i = 0; i < CORE_WORKERS; i++) join(c, h[i]);
     int now, held_max;
     kern_core_stats(&now, &held_max);
-    DWORD cpus = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    uint32_t cpus = plat_cpu_count();
     int gate = !cfg_bool("TOTK_FREE_CORES");   // the kernel's own switch
     int ok = g_run_max <= 3 && held_max <= 3 && !g_core_clash && (cpus < 4 || g_run_max == 3);
-    printf("virtual cores: %d threads x %d runs on %lu host CPUs: at most %ld running guest code at once, at most %d "
+    printf("virtual cores: %d threads x %d runs on %u host CPUs: at most %ld running guest code at once, at most %d "
            "core holders (kernel count), %ld core-number clashes: %s\n", CORE_WORKERS, CORE_RUNS, cpus, g_run_max,
            held_max, g_core_clash, !gate ? "not checked (TOTK_FREE_CORES is set)" : ok ? "ok" : "FAIL");
     CHECK(ok || !gate, "virtual cores");

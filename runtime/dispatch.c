@@ -18,11 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <sys/mman.h>
-#endif
+#include "platform/platform.h"
 
 #define TABLE_SPAN_LIMIT (1ull << 30)   // guest bytes covered by the table, and its size in bytes
 #define HOST_CAP 8192                   // host function registry, power of two
@@ -91,22 +87,11 @@ void rt_register_host(uint64_t addr, GuestFn fn) {
     g_nhost++;
 }
 
-static void *table_alloc(uint64_t bytes) {
-#ifdef _WIN32
-    return VirtualAlloc(NULL, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);   // zero pages, backed on first write
-#else
-    void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    return p == MAP_FAILED ? NULL : p;
-#endif
-}
+static void *table_alloc(uint64_t bytes) { return plat_mem_alloc(bytes); }   // zero pages, backed on first write
 
 static void table_seal(void *p, uint64_t bytes) {
-#ifdef _WIN32
-    DWORD old;
-    if (!VirtualProtect(p, bytes, PAGE_READONLY, &old)) rt_fatal("dispatch: VirtualProtect failed (%lu)", GetLastError());
-#else
-    if (mprotect(p, bytes, PROT_READ)) rt_fatal("dispatch: mprotect failed");
-#endif
+    if (!plat_mem_protect((uint64_t)(uintptr_t)p, bytes, PLAT_PROT_READ))
+        rt_fatal("dispatch: protecting the table failed (%u)", plat_last_error());
 }
 
 void rt_dispatch_init(const RtModule *mods, int count) {

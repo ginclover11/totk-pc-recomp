@@ -1,6 +1,6 @@
 # Architecture
 
-How the Switch build of *Tears of the Kingdom* becomes a native Windows x86-64 program. The upstream projects it builds on are listed under Credits in the [README](../README.md).
+How the Switch build of *Tears of the Kingdom* becomes a native x86-64 program, for Windows and, in progress, Linux. The upstream projects it builds on are listed under Credits in the [README](../README.md).
 
 ## Starting points
 
@@ -41,7 +41,7 @@ MacNativeGames cannot run on x86-64 as is: its CPU path executes ARM64 code nati
     exits, and reloaded after them. A call reloads only X0-X18 and X30, as AAPCS64 has the callee preserve X19-X29 and
     SP; `gen.py --no-callee-saved-trust` reloads those too.
 - Coverage oracle: MacNativeGames' NSO rewriter lists every site where game code touches the OS (SVCs, TLS reads, counter reads, `x18`, exclusive windows, jump tables): 68,968 sites in 1.4.3 `main`. The lifter must handle every one.
-- Memory: guest address equals host address, all below 2^39 (IPC encodes 39-bit addresses). The heap, stacks and the alias region are reserved with `MEM_WRITE_WATCH`, so the graphics back end can ask which pages the CPU wrote since the last upload (`runtime/memory.c`).
+- Memory: guest address equals host address, all below 2^39 (IPC encodes 39-bit addresses). The heap, stacks and the alias region are reserved with write tracking, so the graphics back end can ask which pages the CPU wrote since the last upload (`runtime/memory.c`): `MEM_WRITE_WATCH` on Windows, `PAGEMAP_SCAN` over asynchronous userfaultfd write protection on Linux.
 - Indirect branches go through `rt_dispatch` (`runtime/dispatch.c`), which looks the target up in the address table and tail-calls it.
 - Testing: LAS Recomp's differential harness, every lifted instruction class checked against Unicorn (test-only, never linked into the game).
 
@@ -49,13 +49,13 @@ MacNativeGames cannot run on x86-64 as is: its CPU path executes ARM64 code nati
 
 - Portable C from MacNativeGames: threads and synchronisation, IPC, memory services, fs/RomFS, time, account, applet, audio renderer and effects. The Apple pieces (mach VM, CommonCrypto, AudioToolbox, GameController) are replaced with Win32 and SDL3.
 - SDK boundary at the `nn::*` function level, matching MacNativeGames. Only `audren:u` and `sm:` are real IPC services.
-- Window, keyboard and mouse: Win32 (`gfx_window.c`, `input_win.c`). Gamepad and audio output: SDL3. Voice: libopus (BSD). Movies: the SDK's `movie::Decoder` is replaced by a host VP9 decoder over libvpx (BSD, static; `runtime/ov_movie.c`), because FFmpeg from MSYS2 is a GPL build.
+- Window, keyboard and mouse: Win32 (`gfx_window_win.c`, `input_win.c`); on Linux, stand-ins so far (`gfx_window_posix.c`, `input_posix.c`). Gamepad and audio output: SDL3. Voice: libopus (BSD). Movies: the SDK's `movie::Decoder` is replaced by a host VP9 decoder over libvpx (BSD, static; `runtime/ov_movie.c`), because FFmpeg from MSYS2 is a GPL build.
 - zstd: most RomFS files of 1.4.3 are zstd frames. The patch set `zstd` sends the game's two decoder entry points to
   libzstd on the host (`ov_zstd.c`, `TOTK_ZSTD_NATIVE`); the lifted decoder took almost three times as long.
 - Settings and menu: every key with its default is in one table (`cfg.c`), read from `totk.ini` and `TOTK_*`
   variables and written back when the in-game menu changes it. The menu and the performance overlay are Dear ImGui,
   drawn into the swapchain image (`runtime/ui/`); their text is in `ui_text.c` (English, Russian).
-- OS calls the host makes go through `runtime/platform/` (`platform.h`, `win32.c`), so a Linux or macOS host adds one file instead of touching the rest. The split is not finished: `tools/check_platform.py` lists the Win32 uses left in the other files.
+- OS calls the host makes go through `runtime/platform/` (`platform.h`, with `win32.c` and `posix.c` behind it), so another host adds one file instead of touching the rest. `tools/check_platform.py` holds the rest of the runtime to it and lists the files that stay OS-specific.
 
 #### Threads and cores
 
@@ -69,7 +69,9 @@ Every guest thread is a host thread. TotK assumes Horizon's scheduler: three app
   saves the volatile registers and gives the core up there. A holder of a guest mutex counts at the priority of its
   best waiter, and one inside an SDK spin lock (TLR+0x100 `disable_count`) is not preempted: its interrupt flag is set
   and the switch happens at SVC 0x36. `TOTK_ASYNC_PREEMPT=2` keeps those two without interrupting. The interruption is
-  Win32 (SuspendThread, SetThreadContext); another host needs a signal handler there, as MacNativeGames has.
+  `plat_thread_interrupt`: on Windows the waiter suspends the holder and decides (SuspendThread, SetThreadContext); on
+  Linux a signal runs the same decision in the holder itself, on an alternate stack, as the System V red zone below its
+  stack pointer belongs to the interrupted code. `--probe-preempt` checks every register across thousands of them.
 - Host work gives the core back. Queue submits, presents, GPU waits, shader translation, `nn::fs` calls and NVN memory pool setup run without a core (`NVN_BLOCKING`, `kern_core_away`), as the Switch blocks those threads in IPC, so a thread blocked in the driver or on a file does not hold up guest threads.
 - Spin waits. Loops that only another thread can end (857 in 1.4.3, 864 in 1.2.1, found by `tools/spin_waits.py`, the
   nxnative search) send their back-edges through `rt_spin_gate`, which pauses the core once per pass and hands it to a
@@ -80,7 +82,7 @@ Every guest thread is a host thread. TotK assumes Horizon's scheduler: three app
 
 - NVN front end from MacNativeGames (`nvn_api_*.c`, `nvn_obj.h`, texture layout and deswizzle). The game records command buffers through it; nothing reaches the GPU until the game submits.
 - Vulkan 1.3 back end in place of MacNativeGames' Metal one. At `QueueSubmitCommands` the recorded NVN commands are replayed into Vulkan command buffers (`vk_exec*.c`).
-- Memory pools. Apple's unified memory let MacNativeGames use the game's pools zero-copy. The back end imports the pools as host memory (`VK_EXT_external_memory_host`). On a discrete GPU, pools bound as buffers are mirrored in device-local memory and the pages the CPU wrote (write watch, above) are uploaded before a replay; idle pool regions are made read-only so the write-watch queries skip them (`vk_memory.c`). GPU-rendered textures are written back when the CPU reads them: on a pool invalidate, on a CPU copy, and for small targets once the CPU waits for a fence (`vk_texture.c`).
+- Memory pools. Apple's unified memory let MacNativeGames use the game's pools zero-copy. The back end imports the pools as host memory (`VK_EXT_external_memory_host`). On a discrete GPU, pools bound as buffers are mirrored in device-local memory and the pages the CPU wrote (write watch, above) are uploaded before a replay; idle pool regions are made read-only so the write-watch queries skip them (`vk_memory.c`), on Windows only: `PAGEMAP_SCAN` is fast enough without it. GPU-rendered textures are written back when the CPU reads them: on a pool invalidate, on a CPU copy, and for small targets once the CPU waits for a fence (`vk_texture.c`).
 - Replay thread. `TOTK_REPLAY_ASYNC=1` moves the replay off the submitting thread onto a queue at most one frame behind the game; reads of GPU results wait for the newest writer instead of draining the queue (`vk_backend.c`). It is off by default because no timing has shown a gain yet.
 - Recorder thread. The Vulkan calls the replay makes into its command buffer are made by a thread of their own (`vk_rec.c`, after Savage Wind Recomp and LAS Recomp): each `vkCmd*` copies its arguments into a packet of a ring and the recorder makes the calls in order; calls into other command buffers are made at once, and the submit waits until the ring is empty. In the town on an RX 9070 the replay takes 17% less time on the submitting thread. `TOTK_VK_RECORDER=0` makes every call on the submitting thread.
 - Uniform snapshot. The game rewrites per-object uniform blocks on other threads soon after it submits the frame

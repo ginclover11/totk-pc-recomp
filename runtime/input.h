@@ -33,7 +33,7 @@ int input_pad_label(int pad);
 // start (a held key counts once released and pressed again) and returns NONE; then it returns KEY or PAD with *id the
 // key or pad id (input_map.h) pressed since the last call, or CANCEL for Esc. Keys count only while the game window is in front.
 enum { INPUT_CAPTURE_NONE, INPUT_CAPTURE_KEY, INPUT_CAPTURE_PAD, INPUT_CAPTURE_CANCEL };
-struct InputMap;   // input_map.h (not included here: swkbd_win.c has button names of its own)
+struct InputMap;   // input_map.h (not included here: swkbd.c has button names of its own)
 void input_map_snapshot(struct InputMap *m);
 int input_capture(int reset, int *id);
 // The character on a punctuation key (KEY_MINUS..KEY_GRAVE) in the keyboard layout in use, 0 for another key.
@@ -43,11 +43,11 @@ uint32_t input_key_char(int key);
 // mouse input, cursor hiding and confinement; it returns 1 with *res set when the message is handled. input_cursor_suspend(1)
 // releases the cursor around an F11 window change, (0) captures it again once the client area has its new size.
 #ifdef _WIN32
-int input_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res);
+int input_window_msg(HWND h, unsigned m, WPARAM w, LPARAM l, LRESULT *res);
 int input_cursor_released(void);   // Esc or a non-client activation released the cursor (probe)
 // The menu's Win32 adapter (ui/menu_win.cpp), called next: F1 / Esc open or close the menu; while it is open, keys,
 // mouse and focus go to it. Returns 1 with *res set when the message is fully handled.
-int menu_window_msg(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT *res);
+int menu_window_msg(HWND h, unsigned m, WPARAM w, LPARAM l, LRESULT *res);
 #endif
 void input_cursor_suspend(int on);
 

@@ -8,6 +8,8 @@ service survives and still answers.
 """
 
 import json
+import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -15,8 +17,8 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-EXE = ROOT / "build" / "xlate" / "totk_xlate.exe"
-SPIRV_VAL = Path(r"C:\msys64\ucrt64\bin\spirv-val.exe")
+EXE = ROOT / "build" / "xlate" / ("totk_xlate.exe" if os.name == "nt" else "totk_xlate")
+SPIRV_VAL = Path(r"C:\msys64\ucrt64\bin\spirv-val.exe") if os.name == "nt" else Path(shutil.which("spirv-val") or "spirv-val")
 
 PT = 7 << 16  # predicate "always"
 

@@ -690,7 +690,7 @@ static void tab_advanced(float scale) {
     static char rec_path[600];   // the recording goes beside the log
     if (!rec_path[0]) {
         char dir[512];
-        snprintf(rec_path, sizeof rec_path, "%s\\input-record.txt", sysinfo_log_folder(dir, sizeof dir) ? dir : ".");
+        snprintf(rec_path, sizeof rec_path, "%s" PLAT_SEP "input-record.txt", sysinfo_log_folder(dir, sizeof dir) ? dir : ".");
     }
     row_set_or_not("TOTK_INPUT_RECORD", UI_MENU_INPUT_RECORD, UI_MENU_INPUT_RECORD_DESC, rec_path);
     if (opt_button("##open_log", UI_MENU_OPEN_LOG, UI_MENU_OPEN_LOG_DESC, action_value(log_note, UI_MENU_OPEN_LOG))) {

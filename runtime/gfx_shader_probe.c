@@ -6,8 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
-
+#include "platform/platform.h"
 #include "gfx.h"
 
 int gfx_shader_raw_request(const char *line, char *reply, size_t reply_size);
@@ -50,14 +49,13 @@ static int hexval(char c) { return c <= '9' ? c - '0' : (c | 32) - 'a' + 10; }
 
 // The repository root: the nearest parent of totk.exe holding build/v121/shaders/jobs.json.
 static int find_root(char *root, size_t n) {
-    char exe[MAX_PATH * 2];
-    DWORD len = GetModuleFileNameA(NULL, exe, sizeof exe);
-    if (!len || len >= sizeof exe) return 0;
-    for (char *cut = strrchr(exe, '\\'); cut; cut = strrchr(exe, '\\')) {
+    char exe[PLAT_MAX_PATH * 2];
+    if (!plat_exe_path(exe, sizeof exe)) return 0;
+    for (char *cut = strrchr(exe, PLAT_SEP[0]); cut; cut = strrchr(exe, PLAT_SEP[0])) {
         *cut = 0;
-        char p[MAX_PATH * 2 + 40];
-        snprintf(p, sizeof p, "%s\\build\\v121\\shaders\\jobs.json", exe);
-        if (GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES) return snprintf(root, n, "%s", exe) < (int)n;
+        char p[PLAT_MAX_PATH * 2 + 40];
+        snprintf(p, sizeof p, "%s" PLAT_SEP "build" PLAT_SEP "v121" PLAT_SEP "shaders" PLAT_SEP "jobs.json", exe);
+        if (plat_file_exists(p)) return snprintf(root, n, "%s", exe) < (int)n;
     }
     return 0;
 }
@@ -95,15 +93,15 @@ static int pick_entries(const char *jobs, Entry *out) {
     return got;
 }
 
-static char root[MAX_PATH * 2];
+static char root[PLAT_MAX_PATH * 2];
 
 // Builds the program the game would hand NVN for a census entry and translates it.
 static const GfxShader *translate(const Entry *e, int *err) {
-    char path[MAX_PATH * 2 + 64];
+    char path[PLAT_MAX_PATH * 2 + 64];
     uint8_t c1[8192], control[0x880] = {0};
     if (e->c1_len > sizeof c1) return *err = 1, NULL;
     for (size_t b = 0; b < e->c1_len; b++) c1[b] = (uint8_t)(hexval(e->c1[b * 2]) << 4 | hexval(e->c1[b * 2 + 1]));
-    snprintf(path, sizeof path, "%s\\build\\v121\\shaders\\code\\%s.code", root, e->key);
+    snprintf(path, sizeof path, "%s" PLAT_SEP "build" PLAT_SEP "v121" PLAT_SEP "shaders" PLAT_SEP "code" PLAT_SEP "%s.code", root, e->key);
     size_t body_size;
     char *body = slurp(path, &body_size);
     if (!body) return *err = 1, NULL;
@@ -121,27 +119,23 @@ static const GfxShader *translate(const Entry *e, int *err) {
 }
 
 static void remove_dir(const char *dir) {
-    char pat[MAX_PATH * 2];
-    snprintf(pat, sizeof pat, "%s\\*", dir);
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pat, &fd);
-    if (h != INVALID_HANDLE_VALUE) {
-        do {
-            char f[MAX_PATH * 2];
-            snprintf(f, sizeof f, "%s\\%s", dir, fd.cFileName);
-            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) DeleteFileA(f);
-        } while (FindNextFileA(h, &fd));
-        FindClose(h);
+    PlatDir *d = plat_dir_open(dir);
+    PlatDirEntry e;
+    while (d && plat_dir_next(d, &e)) {
+        char f[PLAT_MAX_PATH * 2];
+        snprintf(f, sizeof f, "%s" PLAT_SEP "%s", dir, e.name);
+        if (!e.is_dir) plat_file_delete(f);
     }
-    RemoveDirectoryA(dir);
+    plat_dir_close(d);
+    plat_dir_remove(dir);
 }
 
 #define FAIL_IF(cond, ...) do { if (cond) { printf("probe-shader: FAILED: " __VA_ARGS__); printf("\n"); remove_dir(dir); return 1; } } while (0)
 
 int probe_shader(void) {
-    char path[MAX_PATH * 2 + 64];
+    char path[PLAT_MAX_PATH * 2 + 64];
     CHECK(find_root(root, sizeof root), "build/v121/shaders/jobs.json not found (run tools/shader_census.py)");
-    snprintf(path, sizeof path, "%s\\build\\v121\\shaders\\jobs.json", root);
+    snprintf(path, sizeof path, "%s" PLAT_SEP "build" PLAT_SEP "v121" PLAT_SEP "shaders" PLAT_SEP "jobs.json", root);
     size_t jobs_size;
     char *jobs = slurp(path, &jobs_size);
     CHECK(jobs, "cannot read %s", path);
@@ -149,9 +143,9 @@ int probe_shader(void) {
     int count = pick_entries(jobs, entries);
     CHECK(count == WANT, "only %d census shaders usable", count);
 
-    char dir[MAX_PATH];
-    snprintf(dir, sizeof dir, "%s\\totk-shader-probe-%lu", getenv("TEMP") ? getenv("TEMP") : ".", GetCurrentProcessId());
-    CHECK(_putenv_s("TOTK_SHADER_CACHE", dir) == 0, "cannot set TOTK_SHADER_CACHE");
+    char dir[PLAT_MAX_PATH], temp[PLAT_MAX_PATH / 2];
+    snprintf(dir, sizeof dir, "%s" PLAT_SEP "totk-shader-probe-%u", plat_temp_dir(temp, sizeof temp) ? temp : ".", plat_process_id());
+    CHECK(plat_setenv("TOTK_SHADER_CACHE", dir), "cannot set TOTK_SHADER_CACHE");
 
     // pass 1: translate through the service
     const GfxShader *first[WANT];
@@ -198,10 +192,10 @@ int probe_shader(void) {
     FAIL_IF(strncmp(reply, "fail ", 5), "malformed line answered with \"%s\"", reply);
     FAIL_IF(!gfx_shader_raw_request("{\"job\":{\"stage\":\"ps\"},\"out\":\"x\"}", reply, sizeof reply) || strncmp(reply, "fail ", 5),
             "job without key not rejected");
-    char dir_json[MAX_PATH * 2], line[MAX_PATH * 4 + 1024], *o = dir_json;
+    char dir_json[PLAT_MAX_PATH * 2], line[PLAT_MAX_PATH * 4 + 1024], *o = dir_json;
     for (const char *s = dir; *s; s++) { if (*s == '\\') *o++ = '\\'; *o++ = *s; }
     *o = 0;
-    char esc_root[MAX_PATH * 2];
+    char esc_root[PLAT_MAX_PATH * 2];
     o = esc_root;
     for (const char *s = root; *s; s++) { if (*s == '\\') *o++ = '\\'; *o++ = *s; }
     *o = 0;

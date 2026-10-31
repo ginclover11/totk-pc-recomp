@@ -8,6 +8,7 @@
 #include "cfg.h"
 #include "host.h"
 #include "input_map.h"
+#include "platform/platform.h"
 
 #define STICK_MAX 32767
 #define DIAGONAL 23170   // STICK_MAX / sqrt(2)
@@ -67,13 +68,13 @@ void input_map_reset(void) { input_map = defaults; }
 
 static int key_id(const char *name) {
     for (int k = KEY_A; k < KEY_COUNT; k++)
-        if (key_names[k] && !_stricmp(key_names[k], name)) return k;
+        if (key_names[k] && !strcasecmp(key_names[k], name)) return k;
     return KEY_NONE;
 }
 
 static int pad_id(const char *name) {
     for (int p = PAD_SOUTH; p < PAD_COUNT; p++)
-        if (!_stricmp(pad_names[p], name)) return p;
+        if (!strcasecmp(pad_names[p], name)) return p;
     return PAD_NONE;
 }
 
@@ -120,25 +121,25 @@ static void pads_put(InputMap *m, int layout, int action, const uint8_t *list, i
 int input_map_bind(const char *button, const char *list) {
     int action = -1;
     for (int a = 0; a < ACTION_COUNT; a++)
-        if (!_stricmp(action_names[a], button)) action = a;
+        if (!strcasecmp(action_names[a], button)) action = a;
     if (action < 0) { rt_log("input: bind: unknown button '%s'", button); return 0; }
     uint8_t keys[INPUT_BINDING_MAX], pads[INPUT_PAD_BINDING_MAX];
     int nk = 0, np = 0, none = 0, key_def = 0, pad_def = 0, bad = 0;
     char buf[256];
     snprintf(buf, sizeof buf, "%s", list);
-    for (char *save = NULL, *tok = strtok_s(buf, ",", &save); tok; tok = strtok_s(NULL, ",", &save)) {
+    for (char *save = NULL, *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
         tok = trim(tok);
-        if (!_stricmp(tok, "none")) { none = 1; continue; }
+        if (!strcasecmp(tok, "none")) { none = 1; continue; }
         int ok = 0;
-        if (!_strnicmp(tok, "pad:", 4) && action < B_SL_LEFT) {
+        if (!strncasecmp(tok, "pad:", 4) && action < B_SL_LEFT) {
             const char *name = trim(tok + 4);
             int p = pad_id(name);
-            if (!_stricmp(name, "default")) pad_def = ok = 1;
+            if (!strcasecmp(name, "default")) pad_def = ok = 1;
             else if (p && np < INPUT_PAD_BINDING_MAX) pads[np++] = (uint8_t)p, ok = 1;
-        } else if (!_strnicmp(tok, "key:", 4)) {
+        } else if (!strncasecmp(tok, "key:", 4)) {
             const char *name = trim(tok + 4);
             int k = key_id(name);
-            if (!_stricmp(name, "default")) key_def = ok = 1;
+            if (!strcasecmp(name, "default")) key_def = ok = 1;
             else if (k && nk < INPUT_BINDING_MAX) keys[nk++] = (uint8_t)k, ok = 1;
         }
         if (!ok) {
@@ -283,8 +284,8 @@ void input_map_line(const InputMap *m, int action, char *out, size_t n) {
 }
 
 int input_pad_layout_pick(const char *setting, int east_labelled_a) {
-    if (setting && !_stricmp(setting, "nintendo")) return PAD_LAYOUT_NINTENDO;
-    if (setting && !_stricmp(setting, "xbox")) return PAD_LAYOUT_XBOX;
+    if (setting && !strcasecmp(setting, "nintendo")) return PAD_LAYOUT_NINTENDO;
+    if (setting && !strcasecmp(setting, "xbox")) return PAD_LAYOUT_XBOX;
     return east_labelled_a ? PAD_LAYOUT_NINTENDO : PAD_LAYOUT_XBOX;
 }
 

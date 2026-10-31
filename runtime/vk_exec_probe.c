@@ -7,8 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
-
+#include "platform/platform.h"
 #include "cfg.h"
 #include "gfx.h"
 #include "host.h"
@@ -31,14 +30,14 @@
         }                                                                                                              \
     } while (0)
 
-static DWORD main_tid;
+static uint32_t main_tid;
 static uint64_t ran[SUBMITS + TAIL + 8];
 static long nran, on_main;
 
 static void note(void *arg) {   // completion thread
     if (nran < (long)(sizeof ran / sizeof ran[0])) ran[nran] = (uint64_t)(uintptr_t)arg;
     nran++;
-    if (GetCurrentThreadId() == main_tid) on_main++;
+    if (plat_thread_id() == main_tid) on_main++;
 }
 
 typedef struct { volatile uint32_t *word; uint32_t value; } WordWrite;
@@ -127,7 +126,7 @@ static int test_present(const GfxBackend *b, uint8_t *guest, int *w_out, int *h_
 
     uint64_t frames = gfx_stats().frames;
     // the exact colour check needs the bilinear blit: FSR's approximate reciprocals move a flat colour by 1/255
-    _putenv_s("TOTK_UPSCALER", "bilinear");
+    plat_setenv("TOTK_UPSCALER", "bilinear");
     vk_present_capture(1);
     const int crop[4] = {0, 0, TEX_W, TEX_H};
     b->present(&t, crop, 0);
@@ -309,14 +308,13 @@ static char *dr_read(const char *path, long *size) {
 }
 
 static int dr_root(char *root, size_t n) {
-    char exe[MAX_PATH * 2];
-    DWORD len = GetModuleFileNameA(NULL, exe, sizeof exe);
-    if (!len || len >= sizeof exe) return 0;
-    for (char *cut = strrchr(exe, '\\'); cut; cut = strrchr(exe, '\\')) {
+    char exe[PLAT_MAX_PATH * 2];
+    if (!plat_exe_path(exe, sizeof exe)) return 0;
+    for (char *cut = strrchr(exe, PLAT_SEP[0]); cut; cut = strrchr(exe, PLAT_SEP[0])) {
         *cut = 0;
-        char p[MAX_PATH * 2 + 40];
-        snprintf(p, sizeof p, "%s\\build\\v121\\shaders\\jobs.json", exe);
-        if (GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES) return snprintf(root, n, "%s", exe) < (int)n;
+        char p[PLAT_MAX_PATH * 2 + 40];
+        snprintf(p, sizeof p, "%s" PLAT_SEP "build" PLAT_SEP "v121" PLAT_SEP "shaders" PLAT_SEP "jobs.json", exe);
+        if (plat_file_exists(p)) return snprintf(root, n, "%s", exe) < (int)n;
     }
     return 0;
 }
@@ -329,8 +327,8 @@ static prog_t *dr_prog(const char *root, const DrawEnt *e[], int n) {
     prog_t *p = calloc(1, sizeof *p);
     p->magic = NVN_PROG_MAGIC, p->serial = ++serial;
     for (int i = 0; i < n; i++) {
-        char path[MAX_PATH * 2 + 128];
-        snprintf(path, sizeof path, "%s\\build\\v121\\shaders\\code\\%.64s.code", root, e[i]->key);
+        char path[PLAT_MAX_PATH * 2 + 128];
+        snprintf(path, sizeof path, "%s" PLAT_SEP "build" PLAT_SEP "v121" PLAT_SEP "shaders" PLAT_SEP "code" PLAT_SEP "%.64s.code", root, e[i]->key);
         long body;
         char *raw = dr_read(path, &body);
         if (!raw) return free(p), NULL;
@@ -395,9 +393,9 @@ static uint8_t *draw_prefix(uint8_t *q, prog_t *prog, const pool_t *pool, tex_t 
 }
 
 static int test_draw(const GfxBackend *b, uint8_t *guest, int *n_drawn, int *n_tries, int *n_cs) {
-    char root[MAX_PATH * 2], path[MAX_PATH * 2 + 64];
+    char root[PLAT_MAX_PATH * 2], path[PLAT_MAX_PATH * 2 + 64];
     CHECK(dr_root(root, sizeof root), "build/v121/shaders/jobs.json not found");
-    snprintf(path, sizeof path, "%s\\build\\v121\\shaders\\jobs.json", root);
+    snprintf(path, sizeof path, "%s" PLAT_SEP "build" PLAT_SEP "v121" PLAT_SEP "shaders" PLAT_SEP "jobs.json", root);
     long size;
     char *jobs = dr_read(path, &size);
     DrawEnt *e = malloc(sizeof *e * 20000);
@@ -854,7 +852,7 @@ static int test_mirror(const GfxBackend *b, uint8_t *guest, int *bytes) {
 
 int probe_vkexec(void) {
     layouts_equal = 0;
-    main_tid = GetCurrentThreadId();
+    main_tid = plat_thread_id();
     const GfxBackend *b = &gfx_vulkan_backend;
     uint64_t heap = 0;
     CHECK(mem_set_heap_size(16ull << 20, &heap) == 0 && heap, "SetHeapSize 16 MiB");

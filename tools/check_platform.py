@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Fails when runtime code outside runtime/platform/ uses the Win32 API directly.
 
-New runtime code goes through runtime/platform/platform.h. Files that still use Win32 are listed in ALLOWED with the
-reason; the list shrinks as the platform layer takes over.
+New runtime code goes through runtime/platform/platform.h, which win32.c and posix.c implement. The few files that may
+use Win32 are listed in ALLOWED with the reason.
 A file in ALLOWED that no longer matches is noted, so the entry gets removed.
 
 Usage: python tools/check_platform.py [--root DIR]   (DIR holds runtime/; default: the repository root)
@@ -12,54 +12,23 @@ import re
 import sys
 from pathlib import Path
 
-# Per-file allowlist. "window", "input", "audio" and "probe" are permanent (OS-specific by nature); the rest wait for
-# 2.7a (memory, faults, page tracking) or 2.7b (threads, time, locks, FP state).
+# Per-file allowlist: the files that are OS-specific by nature, and the Windows-only blocks of shared files. A shared
+# file's block is under #ifdef _WIN32 with a #else for the other systems.
 ALLOWED = {
-    "gfx_window.c": "window",
-    "gfx_window_probe.c": "probe",
+    "gfx_window_win.c": "window",
+    "gfx_window_probe_win.c": "probe",
     "input_win.c": "input",
     "prof_win.c": "profiler",
     "rdoc_win.c": "RenderDoc loader",
-    "audren.c": "audio",
-    "kernel_probe.c": "probe",
-    "nvn_probe.c": "probe",
-    "ov_probe.c": "probe",
-    "tex_probe.c": "probe",
-    "vk_exec_probe.c": "probe",
-    "gfx_shader_probe.c": "probe",
-    "gfx_shader.c": "2.7b: threads, SRW locks, interlocked counters, tick count",
-    "memory.c": "2.7a",
-    "kernel.c": "2.7a/b",
-    "main.c": "2.7a/b",
-    "dispatch.c": "2.7b",
-    "loader.c": "2.7a",
-    "svc.c": "2.7b",
-    "vk_memory.c": "2.7a",
-    "vk_texture.c": "2.7b",
-    "audren.h": "pending: SRW locks, threads, files; not in 2.7a/b/c scope yet",
-    "boot.c": "pending: SRW locks, threads, files; not in 2.7a/b/c scope yet",
-    "flight.c": "pending: SRW locks, threads, files; not in 2.7a/b/c scope yet",
-    "fs_host.c": "pending: SRW locks, threads, files; not in 2.7a/b/c scope yet",
-    "ipc.c": "pending: SRW locks, threads, files; not in 2.7a/b/c scope yet",
-    "nvn_api_cmd.c": "pending: SRW locks, threads, files; not in 2.7a/b/c scope yet",
-    "nvn_api_core.c": "pending: SRW locks, threads, files; not in 2.7a/b/c scope yet",
-    "nvn_api_obj.c": "pending: SRW locks, threads, files; not in 2.7a/b/c scope yet",
-    "nvn_procs.c": "pending: SRW locks, threads, files; not in 2.7a/b/c scope yet",
-    "ov_gfx.c": "pending: SRW locks, threads, files; not in 2.7a/b/c scope yet",
-    "ov_input.c": "pending: SRW locks, threads, files; not in 2.7a/b/c scope yet",
-    "ov_media.c": "pending: SRW locks, threads, files; not in 2.7a/b/c scope yet",
-    "ov_system.c": "pending: SRW locks, threads, files; not in 2.7a/b/c scope yet",
-    "romfs.c": "pending: SRW locks, threads, files; not in 2.7a/b/c scope yet",
-    "tex_astc_mt.c": "pending: SRW locks, threads, files; not in 2.7a/b/c scope yet",
-    "vk_backend.c": "pending: SRW locks, threads, files; not in 2.7a/b/c scope yet",
-    "vk_device.c": "pending: SRW locks, threads, files; not in 2.7a/b/c scope yet",
-    "vk_dump.c": "pending: SRW locks, threads, files; not in 2.7a/b/c scope yet",
-    "vk_pipeline.c": "pending: SRW locks, threads, files; not in 2.7a/b/c scope yet",
-    "vk_sync.c": "pending: SRW locks, threads, files; not in 2.7a/b/c scope yet",
+    "swkbd.c": "the Win32 text entry window",
+    "input.h": "the window procedure's declarations",
+    "kernel.c": "kern_ap_stub for Win64 and dg_sample's look at another thread",
+    "vk.h": "vulkan_win32.h",
+    "flight.c": "the F8 trigger",
 }
 
 INCLUDE = re.compile(r'^\s*#\s*include\s*[<"](windows|winsock2|ws2tcpip|synchapi|memoryapi|processthreadsapi|'
-                     r'fileapi|handleapi|libloaderapi|winbase|winnt)\.h[>"]', re.M)
+                     r'fileapi|handleapi|libloaderapi|winbase|winnt|bcrypt|psapi|timeapi|shellapi|io)\.h[>"]', re.M)
 CALLS = [
     "CreateFile[AW]?", "ReadFile", "WriteFile", "CloseHandle", "DeleteFile[AW]?", "MoveFileEx[AW]?", "CreateDirectory[AW]?",
     "FindFirstFile[AW]?", "GetFileAttributes[AW]?", "GetFileSizeEx", "SetFilePointerEx", "SetEndOfFile",
@@ -75,6 +44,13 @@ CALLS = [
     "(Acquire|Release)SRWLock(Exclusive|Shared)", "WakeAllConditionVariable", "WakeConditionVariable",
     "SleepConditionVariableSRW", "InitOnceExecuteOnce", "INIT_ONCE", "Interlocked[A-Za-z0-9]*", "TlsAlloc", "FlsAlloc",
     "LoadLibrary[AW]?", "GetProcAddress", "FreeLibrary", "HANDLE", "DWORD", "LPVOID", "WINAPI",
+    "GetLastError", "MAX_PATH", "LONG", "ULONG", "BOOL", "LARGE_INTEGER", "FILETIME", "HWND", "HMODULE",
+    "SuspendThread", "ResumeThread", "GetThreadContext", "SetThreadContext", "OpenThread", "CONTEXT",
+    "ConvertThreadToFiber(Ex)?", "CreateFiber(Ex)?", "SwitchToFiber", "DeleteFiber", "ConvertFiberToThread",
+    "MEMORY_BASIC_INFORMATION", "EXCEPTION_POINTERS", "OVERLAPPED", "WIN32_FIND_DATA[AW]?", "MultiByteToWideChar",
+    "WideCharToMultiByte", "FlushFileBuffers", "GetFullPathName[AW]?", "timeBeginPeriod", "BCrypt[A-Za-z]+",
+    "_stricmp", "_strnicmp", "_strdup", "_aligned_malloc", "_aligned_free", "_wfopen", "_fseeki64", "_ftelli64",
+    "_putenv_s", "_tzset", "_get_timezone", "strtok_s", "_exit",
 ]
 CALL_RE = re.compile(r"\b(" + "|".join(CALLS) + r")\b")
 
@@ -103,7 +79,10 @@ def main():
     a = ap.parse_args()
     rt = Path(a.runtime) if a.runtime else Path(a.root) / "runtime"
     bad, remaining = [], {}
-    for p in sorted(list(rt.glob("*.c")) + list(rt.glob("*.h")) + list(rt.glob("*.cpp"))):
+    for p in sorted(list(rt.glob("*.c")) + list(rt.glob("*.h")) + list(rt.glob("*.cpp")) + list(rt.glob("ui/*.cpp")) +
+                    list(rt.glob("ui/*.h"))):
+        if p.name == "menu_win.cpp":
+            continue   # the menu's Win32 adapter, built only for Windows
         hits = scan(p)
         if p.name in ALLOWED:
             remaining[p.name] = len(hits)

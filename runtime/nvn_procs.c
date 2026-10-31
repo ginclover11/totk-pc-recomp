@@ -5,8 +5,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
-
+#include "platform/platform.h"
 #include "gfx.h"
 #include "host.h"
 
@@ -50,13 +49,14 @@ void nvn_procs_register(void) {
 
 uint64_t nvn_proc_address(const char *name) {
     if (!name) return 0;
-    const Proc *p = bsearch(&(Proc){name, 0}, procs, (size_t)nprocs, sizeof *procs, by_name);
+    Proc key = {name, 0};
+    const Proc *p = bsearch(&key, procs, (size_t)nprocs, sizeof *procs, by_name);
     if (p) return p->addr;
     // Unknown names get NULL, as on hardware; each distinct one is logged once.
-    static SRWLOCK lock = SRWLOCK_INIT;
+    static PlatMutex lock = PLAT_MUTEX_INIT;
     static char seen[32][96];
     static int nseen;
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     int fresh = 1;
     for (int i = 0; i < nseen; i++)
         if (!strncmp(seen[i], name, sizeof seen[i] - 1)) fresh = 0;
@@ -66,7 +66,7 @@ uint64_t nvn_proc_address(const char *name) {
     } else {
         fresh = 0;
     }
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
     if (fresh) rt_log("nvn: no such proc \"%s\", returning NULL", name);
     return 0;
 }

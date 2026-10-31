@@ -4,7 +4,7 @@
 // and the service table. The SDK client code runs unchanged: requests are read from the calling thread's message
 // buffer (TLR, or the user buffer of 0x22) and answered in place. Unknown ports, services and commands stop with their
 // name and id instead of returning a fake success. Also --probe-ipc.
-#include <windows.h>
+#include "platform/platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,20 +31,20 @@ static volatile long g_live;
 static volatile long long g_released, g_requests;
 static _Thread_local const Cpu *t_req;   // guest context of the request being served
 
-long ipc_sessions_live(void) { return InterlockedCompareExchange(&g_live, 0, 0); }
-uint64_t ipc_sessions_released(void) { return (uint64_t)InterlockedCompareExchange64(&g_released, 0, 0); }
+long ipc_sessions_live(void) { return __sync_val_compare_and_swap(&g_live, 0, 0); }
+uint64_t ipc_sessions_released(void) { return (uint64_t)__sync_val_compare_and_swap(&g_released, 0, 0); }
 
 // ---- sessions
 uint32_t ipc_session_new(const char *name, IpcHandler handler, void *state, void (*close)(void *state)) {
     IpcSession *s = calloc(1, sizeof *s);
     if (!s) rt_fatal("ipc: session allocation");
     *s = (IpcSession){name, handler, state, close, 1};
-    InterlockedIncrement(&g_live);
+    __atomic_add_fetch(&g_live, 1, __ATOMIC_SEQ_CST);
     return kern_handle_new(KERN_SESSION, s);
 }
 
 static uint32_t session_clone(IpcSession *s) {
-    InterlockedIncrement(&s->refs);
+    __atomic_add_fetch(&s->refs, 1, __ATOMIC_SEQ_CST);
     return kern_handle_new(KERN_SESSION, s);
 }
 
@@ -55,20 +55,18 @@ void ipc_handle_closed(int kind, void *obj) {
     }
     if (kind != KERN_SESSION) rt_fatal("ipc_handle_closed: handle kind %d", kind);
     IpcSession *s = obj;
-    if (InterlockedDecrement(&s->refs)) return;
+    if (__atomic_sub_fetch(&s->refs, 1, __ATOMIC_SEQ_CST)) return;
     if (rt_trace & RT_TRACE_IPC) rt_log("ipc: %s closed", s->name);
     if (s->close) s->close(s->state);
     free(s);
-    InterlockedDecrement(&g_live);
-    InterlockedIncrement64(&g_released);
+    __atomic_sub_fetch(&g_live, 1, __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&g_released, 1, __ATOMIC_SEQ_CST);
 }
 
 // ---- helpers for services
 static int readable(uint64_t a, uint64_t n) {
-    MEMORY_BASIC_INFORMATION mbi;
-    if (!VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return 0;
-    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
-    return a + n <= (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+    uint8_t probe[64];
+    return n <= sizeof probe && plat_mem_read(a, probe, n);
 }
 
 void ipc_backtrace(void) {
@@ -213,7 +211,7 @@ static void dispatch(IpcSession *s, uint32_t *m) {
     unsigned ndata;
     parse(m, &rq, &words, &ndata);
     if (rq.type == T_CLOSE || rq.type == T_TIPC_CLOSE) return;
-    InterlockedIncrement64(&g_requests);
+    __atomic_add_fetch(&g_requests, 1, __ATOMIC_SEQ_CST);
     IpcResponse rs;
     memset(&rs, 0, sizeof rs);
     int tipc = rq.type >= T_TIPC_BASE;
@@ -655,30 +653,12 @@ static void child_main(Cpu *c) {
 
 // Re-run this executable with the same arguments and PROBE_CHILD_ENV set; it must stop with the named fatal.
 static void probe_unknown_service(void) {
-    SECURITY_ATTRIBUTES sa = {sizeof sa, NULL, TRUE};
-    HANDLE rd, wr;
-    if (!CreatePipe(&rd, &wr, &sa, 0)) rt_fatal("probe-ipc: CreatePipe failed (error %lu)", GetLastError());
-    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
-    STARTUPINFOW si = {.cb = sizeof si, .dwFlags = STARTF_USESTDHANDLES, .hStdInput = GetStdHandle(STD_INPUT_HANDLE),
-                       .hStdOutput = wr, .hStdError = wr};
-    PROCESS_INFORMATION pi;
-    wchar_t *cmdline = _wcsdup(GetCommandLineW());
-    SetEnvironmentVariableA(PROBE_CHILD_ENV, "1");
-    BOOL ok = CreateProcessW(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
-    SetEnvironmentVariableA(PROBE_CHILD_ENV, NULL);
-    free(cmdline);
-    CloseHandle(wr);
-    if (!ok) rt_fatal("probe-ipc: CreateProcessW failed (error %lu)", GetLastError());
     static char out[65536];
-    DWORD n, len = 0;
-    while (len < sizeof out - 1 && ReadFile(rd, out + len, (DWORD)(sizeof out - 1 - len), &n, NULL) && n) len += n;
-    out[len] = 0;
-    CloseHandle(rd);
-    WaitForSingleObject(pi.hProcess, 30000);
-    DWORD code = 0;
-    GetExitCodeProcess(pi.hProcess, &code);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
+    uint32_t code = 0;
+    plat_setenv(PROBE_CHILD_ENV, "1");
+    int ok = plat_run_self(out, sizeof out, &code);
+    plat_setenv(PROBE_CHILD_ENV, NULL);
+    if (!ok) rt_fatal("probe-ipc: running the child failed (error %u)", plat_last_error());
     const char *want = "FATAL: sm: service \"" PROBE_UNKNOWN_SERVICE "\" is not implemented";
     const char *line = strstr(out, want);
     printf("child GetServiceHandle(%s): exit code %lu, %s\n", PROBE_UNKNOWN_SERVICE, (unsigned long)code,
@@ -738,7 +718,7 @@ static void probe_sdk_client(Cpu *c) {
     unsigned trace = rt_trace;
     rt_trace |= RT_TRACE_IPC;   // log the requests the SDK sends during set-up
     sdk_prepare(c);
-    uint64_t requests0 = (uint64_t)InterlockedCompareExchange64(&g_requests, 0, 0);
+    uint64_t requests0 = (uint64_t)__sync_val_compare_and_swap(&g_requests, 0, 0);
     uint64_t released0 = ipc_sessions_released();
     int32_t *param = mem_kernel_alloc(0x100, 64);
     rt_call(c, stub(SYM_INIT_PARAM), 1, (uint64_t)(uintptr_t)param);
@@ -783,7 +763,7 @@ static void probe_sdk_client(Cpu *c) {
           "SDK render loop");
     rt_call(c, stub(SYM_STOP), 2, handle[0], handle[1]);
     rt_call(c, stub(SYM_CLOSE), 2, handle[0], handle[1]);
-    uint64_t requests = (uint64_t)InterlockedCompareExchange64(&g_requests, 0, 0) - requests0;
+    uint64_t requests = (uint64_t)__sync_val_compare_and_swap(&g_requests, 0, 0) - requests0;
     printf("sdk: CloseAudioRenderer: renderers running %ld, sessions released +%llu; %llu requests served for the "
            "lifted client (sm: kept open by the SDK: %ld session)\n", audren_renderers_live(),
            (unsigned long long)(ipc_sessions_released() - released0), (unsigned long long)requests,

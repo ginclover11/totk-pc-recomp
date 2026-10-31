@@ -8,7 +8,9 @@
 // Cpu. The SDK's nn::os runs as lifted code; only the kernel under it is the host. Every wait hangs on one global lock
 // G with one condition variable per thread; wake order is the kernel's: lower priority value first, then first come.
 // Semantics follow the public Horizon kernel (KConditionVariable, KAddressArbiter, KSynchronization).
-#include <windows.h>
+#ifdef _WIN32
+#include <windows.h>   // TOTK_CORE_DIAG's samples of another thread's rip (dg_sample)
+#endif
 #define __USE_MINGW_SETJMP_NON_SEH   // setjmp(b) = _setjmp(b, NULL): longjmp restores registers, no SEH unwinding
 #include <setjmp.h>
 #include <stdio.h>
@@ -63,7 +65,7 @@ struct RtThread {
     int prio, core;
     uint64_t mask;
     int started, exited, closed, cancel, is_main;
-    CONDITION_VARIABLE cv;
+    PlatCond cv;
     // current wait
     int wkind, woke;
     uint64_t waddr, wkey;
@@ -78,13 +80,12 @@ struct RtThread {
     uint8_t *tlr, *tls;
     jmp_buf exit_jmp;          // the thread start; ExitThread longjmps to it
     // fibers
-    void *base_fiber;          // the host thread as a host fiber, after the first switch
+    PlatFiber *base_fiber;     // the host thread as a host fiber, after the first switch
     Fiber *fiber;              // current guest fiber, NULL on the thread's own context
     Fiber *leaving;            // fiber just switched away from, released by whoever resumes next
     int exit_pending;          // ExitThread on a fiber: unwind once back on the thread's own context
-    HANDLE timer;              // high-resolution waitable timer for SleepThread
     // TOTK_TRACE=sched accounting (holding G)
-    DWORD tid;                 // host thread id
+    uint32_t tid;                 // host thread id
     int st;                    // S_* state since st_since
     uint64_t st_since, st_ns[S_N], nblk, npre, pre_since, cpu_last;
     uint64_t wobj;             // what the current wait is on: owner handle, key, address or first handle
@@ -94,7 +95,7 @@ struct RtThread {
     uint64_t sp_n, sp_ho, sp_site;   // spin wait passes and core handoffs, the last loop head (the thread writes them)
     RtThread *target;          // as a core waiter: the owner core_kick asked to give its core up for it (holding G)
     // TOTK_ASYNC_PREEMPT (holding G)
-    HANDLE hthr;               // the host thread, for SuspendThread / Get/SetThreadContext; open while it may own a core
+    PlatThreadRef *hthr;       // the host thread, for plat_thread_interrupt; open while it may own a core
     uint64_t ap_rip;           // the interrupted host rip kern_ap_stub returns to
     uint64_t ap_last;          // the last redirect attempt on this owner
     int ap_pending;            // redirected to kern_ap_stub, which has not reached kern_ap_yield yet
@@ -110,7 +111,7 @@ struct RtThread {
                                                                                                  // owner that released
 };
 
-static SRWLOCK G = SRWLOCK_INIT;
+static PlatMutex G = PLAT_MUTEX_INIT;
 static struct { int type; void *obj; } g_h[MAX_H];
 static _Thread_local RtThread *tcur;
 _Static_assert(offsetof(RtThread, preempt) == 0, "host.h kern_preempt_pending reads the first int");
@@ -119,8 +120,8 @@ static RtThread *g_all, *g_wait, *g_main;
 static uint64_t g_next_id = 0x51, g_wseq, g_created;
 static uint64_t g_main_stack;
 
-static void lock(void) { AcquireSRWLockExclusive(&G); }
-static void unlock(void) { ReleaseSRWLockExclusive(&G); }
+static void lock(void) { plat_mutex_lock(&G); }
+static void unlock(void) { plat_mutex_unlock(&G); }
 
 uint64_t kern_now_ns(void) { return plat_now_ns(); }
 
@@ -239,7 +240,7 @@ static void wake(RtThread *t, uint32_t res) {
     t->waker = tcur ? tcur->handle : 0;
     if (rt_trace & RT_TRACE_SCHED) t->wake_at = kern_now_ns();
     if (g_crit_on) crit_add(CRIT_WAKE, t->handle, t->waker, 0, 0, t->wake_at);
-    WakeConditionVariable(&t->cv);
+    plat_cond_signal(&t->cv);
 }
 
 static void wake_sync_waiters(void) {
@@ -268,7 +269,7 @@ static uint32_t block_inner(RtThread *t, int kind, int64_t ns) {
     uint64_t deadline = forever ? 0 : now + (uint64_t)ns;
     while (!t->woke) {
         if (forever) {
-            SleepConditionVariableSRW(&t->cv, &G, INFINITE, 0);
+            plat_cond_wait(&t->cv, &G);
             continue;
         }
         now = kern_now_ns();
@@ -278,7 +279,7 @@ static uint32_t block_inner(RtThread *t, int kind, int64_t ns) {
             return R_TIMEOUT;
         }
         uint64_t ms = (deadline - now + 999999) / 1000000;
-        SleepConditionVariableSRW(&t->cv, &G, ms > 0xFFFFFFF0u ? 0xFFFFFFF0u : (DWORD)ms, 0);
+        plat_cond_wait_ns(&t->cv, &G, (uint64_t)(ms > 0xFFFFFFF0u ? 0xFFFFFFF0u : (uint32_t)ms) * 1000000ull);
     }
     if (t->wake_at) {
         uint64_t d = kern_now_ns() - t->wake_at;
@@ -320,7 +321,7 @@ static int core_allowed(const RtThread *t, int c) { return (int)((t->mask >> c) 
 // Here a better waiter only marks the owner, which gives the core up at its next SVC or indirect call; an owner in a
 // stretch of game code with neither keeps it (TOTK_CORE_DIAG: 0.5-1.1 ms of thread-time per frame, waits to 16 ms and
 // more). With it on, three parts, all of which MacNativeGames found necessary:
-// - The waiter interrupts the owner (SuspendThread, GetThreadContext) when it has waited AP_FIRST_NS, then every
+// - The waiter interrupts the owner (plat_thread_interrupt) when it has waited AP_FIRST_NS, then every
 //   millisecond: if the owner's host rip is in the lifted modules' code (g_gen_lo..g_gen_hi) and its host depth is 0
 //   (not in a host call or SVC, nor in game code a host call made), it holds no host lock, so its rip is moved to
 //   kern_ap_stub, which saves every volatile register, gives the core up like a checkpoint (kern_ap_yield) and jumps
@@ -341,14 +342,18 @@ static int g_ap = -1, g_ap_int;   // g_ap_int: interrupt owners (TOTK_ASYNC_PREE
 static int g_ap_log;              // redirects logged so far (AP_LOG_N)
 #define AP_LOG_N 40
 static uintptr_t g_gen_lo, g_gen_hi;   // host code of the lifted modules: first and last function start
+static uint64_t g_ap_yields;   // kern_ap_stub runs
 static uint64_t g_ap_sent, g_ap_taken, g_ap_host, g_ap_pc, g_ap_deferred, g_ap_fail, g_ap_spin_ok;
 void kern_ap_stub(void);
+
+static uint64_t ap_decide(uint64_t rip, void *arg);
 
 static void ap_init(void) {
     if (g_ap >= 0) return;
     const char *e = cfg_value("TOTK_ASYNC_PREEMPT");
     g_ap = strcmp(e, "0") != 0;
     g_ap_int = g_ap && strcmp(e, "2") != 0;
+    if (g_ap_int) plat_interrupt_init(ap_decide);
     if (g_ap) {
         RtModule m[16];
         int n = rt_linked_modules(m, 16);
@@ -375,8 +380,8 @@ static void ap_init(void) {
     }
     rt_log("kernel: asynchronous preemption of virtual cores %s, priority inheritance and preemption disable %s; lifted "
            "code exe+%#llx-exe+%#llx", g_ap_int ? "on" : "off", g_ap ? "on (TOTK_ASYNC_PREEMPT=0 turns all off)" : "off",
-           (unsigned long long)(g_gen_lo ? g_gen_lo - (uintptr_t)GetModuleHandleW(NULL) : 0),
-           (unsigned long long)(g_gen_hi ? g_gen_hi - (uintptr_t)GetModuleHandleW(NULL) : 0));
+           (unsigned long long)(g_gen_lo ? g_gen_lo - (uintptr_t)plat_image_base() : 0),
+           (unsigned long long)(g_gen_hi ? g_gen_hi - (uintptr_t)plat_image_base() : 0));
 }
 
 // Horizon's priority inheritance: o counts at the priority of the best thread blocked on a guest mutex it owns (the
@@ -403,6 +408,7 @@ static int ap_disabled(const RtThread *t) { return g_ap > 0 && ap_tlr(t)[0]; }
 // in kern_ap_yield and jumps back to kern_ap_rip(), whose value it first stores in the return slot it reserved at
 // entry, so a stack walk sees the interrupted function as its caller. No ret: the jump keeps call/return pairs
 // balanced. The waiter never writes the owner's stack.
+#ifdef _WIN32
 __asm__(".text\n"
         ".globl kern_ap_stub\n"
         ".def kern_ap_stub; .scl 2; .type 32; .endef\n"
@@ -488,65 +494,148 @@ __asm__(".text\n"
         "    leaq 8(%rsp), %rsp\n"
         "    jmpq *-8(%rsp)\n"
         ".seh_endproc\n");
+#else
+// System V: rsi and rdi are volatile too, so they are saved as well, and the 128 bytes below the stack pointer belong to
+// the interrupted code (its red zone), so the frame starts under them. The signal that brought us here ran on the
+// alternate stack (plat_interrupt_init), and any signal arriving before the final jump does too, so the return slot
+// below the restored stack pointer survives until the jump reads it.
+__asm__(".text\n"
+        ".globl kern_ap_stub\n"
+        ".type kern_ap_stub, @function\n"
+        ".p2align 4\n"
+        "kern_ap_stub:\n"
+        "    leaq -136(%rsp), %rsp\n"   // not sub: the flags are still the interrupted code's until pushfq
+        "    pushfq\n"
+        "    pushq %rax\n"
+        "    pushq %rcx\n"
+        "    pushq %rdx\n"
+        "    pushq %rsi\n"
+        "    pushq %rdi\n"
+        "    pushq %r8\n"
+        "    pushq %r9\n"
+        "    pushq %r10\n"
+        "    pushq %r11\n"
+        "    pushq %rbp\n"
+        "    movq %rsp, %rbp\n"
+        "    andq $-32, %rsp\n"
+        "    subq $576, %rsp\n"   // 32: MXCSR saved, 36: MXCSR default, 64: YMM0-15
+        "    vmovdqa %ymm0, 64(%rsp)\n"
+        "    vmovdqa %ymm1, 96(%rsp)\n"
+        "    vmovdqa %ymm2, 128(%rsp)\n"
+        "    vmovdqa %ymm3, 160(%rsp)\n"
+        "    vmovdqa %ymm4, 192(%rsp)\n"
+        "    vmovdqa %ymm5, 224(%rsp)\n"
+        "    vmovdqa %ymm6, 256(%rsp)\n"
+        "    vmovdqa %ymm7, 288(%rsp)\n"
+        "    vmovdqa %ymm8, 320(%rsp)\n"
+        "    vmovdqa %ymm9, 352(%rsp)\n"
+        "    vmovdqa %ymm10, 384(%rsp)\n"
+        "    vmovdqa %ymm11, 416(%rsp)\n"
+        "    vmovdqa %ymm12, 448(%rsp)\n"
+        "    vmovdqa %ymm13, 480(%rsp)\n"
+        "    vmovdqa %ymm14, 512(%rsp)\n"
+        "    vmovdqa %ymm15, 544(%rsp)\n"
+        "    stmxcsr 32(%rsp)\n"
+        "    movl $0x1f80, 36(%rsp)\n"
+        "    ldmxcsr 36(%rsp)\n"
+        "    cld\n"
+        "    vzeroupper\n"
+        "    call kern_ap_rip\n"
+        "    movq %rax, 88(%rbp)\n"   // the return slot: rbp + 10 pushes + pushfq
+        "    call kern_ap_yield\n"
+        "    ldmxcsr 32(%rsp)\n"
+        "    vmovdqa 64(%rsp), %ymm0\n"
+        "    vmovdqa 96(%rsp), %ymm1\n"
+        "    vmovdqa 128(%rsp), %ymm2\n"
+        "    vmovdqa 160(%rsp), %ymm3\n"
+        "    vmovdqa 192(%rsp), %ymm4\n"
+        "    vmovdqa 224(%rsp), %ymm5\n"
+        "    vmovdqa 256(%rsp), %ymm6\n"
+        "    vmovdqa 288(%rsp), %ymm7\n"
+        "    vmovdqa 320(%rsp), %ymm8\n"
+        "    vmovdqa 352(%rsp), %ymm9\n"
+        "    vmovdqa 384(%rsp), %ymm10\n"
+        "    vmovdqa 416(%rsp), %ymm11\n"
+        "    vmovdqa 448(%rsp), %ymm12\n"
+        "    vmovdqa 480(%rsp), %ymm13\n"
+        "    vmovdqa 512(%rsp), %ymm14\n"
+        "    vmovdqa 544(%rsp), %ymm15\n"
+        "    movq %rbp, %rsp\n"
+        "    popq %rbp\n"
+        "    popq %r11\n"
+        "    popq %r10\n"
+        "    popq %r9\n"
+        "    popq %r8\n"
+        "    popq %rdi\n"
+        "    popq %rsi\n"
+        "    popq %rdx\n"
+        "    popq %rcx\n"
+        "    popq %rax\n"
+        "    popfq\n"
+        "    leaq 136(%rsp), %rsp\n"
+        "    jmpq *-136(%rsp)\n"
+        ".size kern_ap_stub, .-kern_ap_stub\n");
+#endif
 
 enum { AP_NONE, AP_RETRY, AP_SENT };
 
-// The waiter w interrupts its target owner if that runs top-level game code (holding G; the owner is suspended only
-// between SuspendThread and ResumeThread, during which nothing here takes a lock).
+// Whether interrupted owner o goes to kern_ap_stub: only from top-level game code, which holds no host lock. Takes no
+// locks and touches only o's fields and atomics: win32.c calls it on the waiter with o suspended, posix.c in the signal
+// handler on o itself (arg NULL), possibly after o has moved on, so everything is checked against o as it is now.
+static uint64_t ap_decide(uint64_t rip, void *arg) {
+    RtThread *o = arg ? arg : tcur;
+    if (!o) return 0;   // the signal arrived as the thread was ending
+    if (rip < g_gen_lo || rip > g_gen_hi) {
+        __atomic_fetch_add(&g_ap_pc, 1, __ATOMIC_RELAXED);
+        return 0;
+    }
+    if (__atomic_load_n(&o->host_depth, __ATOMIC_RELAXED) > 0) {
+        __atomic_fetch_add(&g_ap_host, 1, __ATOMIC_RELAXED);
+        return 0;
+    }
+    volatile uint16_t *tl = ap_tlr(o);
+    if (tl[0]) {
+        tl[1] = 1;
+        __atomic_fetch_add(&g_ap_deferred, 1, __ATOMIC_RELAXED);
+        return 0;
+    }
+    if (o->ap_pending) return 0;   // a signal sent earlier already did it, and the stub has not run
+    o->ap_rip = rip;
+    o->ap_pending = 1;
+    return (uint64_t)(uintptr_t)kern_ap_stub;
+}
+
+// The waiter w interrupts its target owner if that runs top-level game code (holding G; ap_decide takes no lock).
 static int ap_try(RtThread *w) {
     RtThread *o = w->target;
     if (!o || o->cur_core < 0 || !o->preempt) return AP_NONE;
     if (!o->hthr || o->ap_pending) return AP_RETRY;
     volatile uint16_t *tl = ap_tlr(o);
     if (__atomic_load_n(&o->host_depth, __ATOMIC_RELAXED) > 0) {
-        g_ap_host++;
+        __atomic_fetch_add(&g_ap_host, 1, __ATOMIC_RELAXED);
         return AP_RETRY;
     }
     if (tl[0]) {   // preemption disabled: SVC 0x36 switches
         tl[1] = 1;
-        g_ap_deferred++;
+        __atomic_fetch_add(&g_ap_deferred, 1, __ATOMIC_RELAXED);
         return AP_RETRY;
     }
     uint64_t now = kern_now_ns();
     if (o->ap_last && now - o->ap_last < AP_GAP_NS) return AP_RETRY;
     o->ap_last = now;
-    if (SuspendThread(o->hthr) == (DWORD)-1) {
-        g_ap_fail++;
+    int res = plat_thread_interrupt(o->hthr, o);
+    if (res == PLAT_INT_FAILED) {
+        o->ap_pending = 0;
+        __atomic_fetch_add(&g_ap_fail, 1, __ATOMIC_RELAXED);
         return AP_RETRY;
     }
-    CONTEXT ctx;
-    memset(&ctx, 0, sizeof ctx);
-    ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;   // set back whole, so the kernel restores every GPR
-    int r = AP_RETRY;
-    if (!GetThreadContext(o->hthr, &ctx))
-        g_ap_fail++;
-    else if (ctx.Rip < g_gen_lo || ctx.Rip > g_gen_hi)
-        g_ap_pc++;
-    else if (__atomic_load_n(&o->host_depth, __ATOMIC_RELAXED) > 0)
-        g_ap_host++;
-    else if (tl[0]) {
-        tl[1] = 1;
-        g_ap_deferred++;
-    } else {
-        o->ap_rip = ctx.Rip;
-        o->ap_pending = 1;
-        ctx.Rip = (DWORD64)(uintptr_t)kern_ap_stub;
-        if (SetThreadContext(o->hthr, &ctx)) {
-            g_ap_sent++;
-            r = AP_SENT;
-        } else {
-            o->ap_pending = 0;
-            g_ap_fail++;
-        }
-    }
-    ResumeThread(o->hthr);
-    if (r == AP_SENT && g_ap_log < AP_LOG_N) {
+    if (res == PLAT_INT_LEFT) return AP_RETRY;
+    __atomic_fetch_add(&g_ap_sent, 1, __ATOMIC_RELAXED);
+    if (g_ap_log < AP_LOG_N) {
         g_ap_log++;
-        rt_log("kernel: interrupt %#x p%d at exe+%#llx rsp %#llx for %#x p%d", o->handle, o->prio,
-               (unsigned long long)(o->ap_rip - (uintptr_t)GetModuleHandleW(NULL)), (unsigned long long)ctx.Rsp,
-               w->handle, w->prio);
+        rt_log("kernel: interrupt %#x p%d for %#x p%d", o->handle, o->prio, w->handle, w->prio);
     }
-    return r;
+    return AP_SENT;
 }
 
 // ---- TOTK_CORE_DIAG=1: why ready threads wait for a virtual core, and for how long
@@ -572,7 +661,10 @@ typedef struct {
 } DgWindow;
 static DgWindow g_dgw;
 static uint64_t g_dgf[DG_N], g_dgfr[DG_N];   // this frame: all threads, the render thread
-static uint64_t g_dg_samples, g_dg_lines, g_sync36, g_sync36_flag;
+static uint64_t g_dg_lines, g_sync36, g_sync36_flag;
+#ifdef _WIN32
+static uint64_t g_dg_samples;
+#endif
 
 static void diag_init(void) {
     if (g_diag >= 0) return;
@@ -661,18 +753,19 @@ static void dg_done(RtThread *t) {
     memset(&t->dg_rel, 0, sizeof t->dg_rel);
 }
 
+#ifdef _WIN32
 // Once per long DG_GAME or DG_HOST wait: where the owner's host thread runs (module and offset), its latest SVC and
 // its guest lr. Holding G; the owner is resumed before anything that could take a lock it holds.
 static void dg_sample(RtThread *t) {
     RtThread *o = t->target;
     if (!o || o->cur_core < 0 || !o->tid || g_dg_samples >= DG_SAMPLES) return;
-    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, o->tid);
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, 0, o->tid);
     if (!h) return;
     CONTEXT ctx;
     memset(&ctx, 0, sizeof ctx);
     ctx.ContextFlags = CONTEXT_CONTROL;
     int depth = 0, ok = 0;
-    if (SuspendThread(h) != (DWORD)-1) {
+    if (SuspendThread(h) != (uint32_t)-1) {
         ok = GetThreadContext(h, &ctx);
         depth = __atomic_load_n(&o->host_depth, __ATOMIC_RELAXED);
         ResumeThread(h);
@@ -681,10 +774,10 @@ static void dg_sample(RtThread *t) {
     if (!ok) return;
     g_dg_samples++;
     HMODULE m = NULL;
-    wchar_t mw[MAX_PATH] = L"?";
+    wchar_t mw[PLAT_MAX_PATH] = L"?";
     if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            (LPCWSTR)(uintptr_t)ctx.Rip, &m) && m)
-        GetModuleFileNameW(m, mw, MAX_PATH);
+        GetModuleFileNameW(m, mw, PLAT_MAX_PATH);
     const wchar_t *mn = wcsrchr(mw, L'\\') ? wcsrchr(mw, L'\\') + 1 : mw;
     char lr[128];
     rt_log("core-diag: sample owner %#x p%d depth %d rip %ls+%#llx, last svc %#x, guest lr %s (waiter %#x p%d, %s, "
@@ -692,6 +785,9 @@ static void dg_sample(RtThread *t) {
            o->cur ? ldr_describe(o->cur->x[30], lr, sizeof lr) : "-", t->handle, t->prio,
            t->dg_cls == DG_HOST ? "host" : "game", (kern_now_ns() - t->dg_since) / 1e6);
 }
+#else
+static void dg_sample(RtThread *t) { (void)t; }   // a signal could sample it; not written yet
+#endif
 
 
 // perf_present, every present: a line for a present over 25 ms, the 60-present summary.
@@ -788,7 +884,7 @@ static void core_grant(int c) {
     core_count();
     if (g_diag > 0) b->dg_rel = g_dg_rel;
     if (rt_trace & RT_TRACE_SCHED) b->grant_at = kern_now_ns();
-    WakeConditionVariable(&b->cv);
+    plat_cond_signal(&b->cv);
 }
 
 static void core_put(RtThread *t) {
@@ -897,17 +993,17 @@ static void core_take(RtThread *t) {
     if (g_ap_int && t->target && t->cur_core < 0) {   // most waits end within microseconds: spin before interrupting
         uint64_t end = kern_now_ns() + AP_FIRST_NS;
         unlock();
-        while (__atomic_load_n(&t->cur_core, __ATOMIC_RELAXED) < 0 && kern_now_ns() < end) YieldProcessor();
+        while (__atomic_load_n(&t->cur_core, __ATOMIC_RELAXED) < 0 && kern_now_ns() < end) _mm_pause();
         lock();
         if (t->cur_core >= 0) g_ap_spin_ok++;
     }
     int sampled = 0;
     while (t->cur_core < 0) {
-        DWORD ms = INFINITE;
+        uint32_t ms = PLAT_WAIT_FOREVER;
         if (g_ap_int && ap_try(t) != AP_NONE) ms = 1;   // the owner keeps its core: again in a millisecond
         int sample = g_diag > 0 && !sampled && (t->dg_cls == DG_GAME || t->dg_cls == DG_HOST);
-        if (sample && ms == INFINITE) ms = 2;
-        SleepConditionVariableSRW(&t->cv, &G, ms, 0);
+        if (sample && ms == PLAT_WAIT_FOREVER) ms = 2;
+        plat_cond_wait_ns(&t->cv, &G, (uint64_t)(ms) * 1000000ull);
         if (sample && t->cur_core < 0 && kern_now_ns() - t->dg_since >= 2000000) {
             sampled = 1;
             dg_sample(t);
@@ -943,7 +1039,7 @@ int kern_core_away(void) {
     core_put(t);
     acct(t, S_HOST);
     if (rt_trace & RT_TRACE_SCHED)   // the caller as an exe RVA (totk.map)
-        t->wobj = (uintptr_t)__builtin_return_address(0) - (uintptr_t)GetModuleHandleW(NULL);
+        t->wobj = (uintptr_t)__builtin_return_address(0) - (uintptr_t)plat_image_base();
     unlock();
     return 1;
 }
@@ -975,7 +1071,7 @@ static _Thread_local uint64_t sw_head, sw_t0, sw_last;
 
 void rt_spin_gate(Cpu *c, uint64_t head) {
     (void)c;
-    YieldProcessor();
+    _mm_pause();
     RtThread *t = tcur;
     if (!t) return;
     if (g_spin_on < 0) {
@@ -996,7 +1092,7 @@ void rt_spin_gate(Cpu *c, uint64_t head) {
         return;
     t->sp_ho++;
     int away = kern_core_away();
-    SwitchToThread();
+    plat_yield();
     kern_core_back(&away);
     sw_last = kern_now_ns();
 }
@@ -1034,6 +1130,7 @@ uint64_t kern_ap_rip(void) { return tcur->ap_rip; }
 
 void kern_ap_yield(void) {
     RtThread *t = tcur;
+    __atomic_fetch_add(&g_ap_yields, 1, __ATOMIC_RELAXED);
     lock();
     t->ap_pending = 0;
     if (t->preempt && t->cur_core >= 0 && !ap_disabled(t) && core_better_waiter(t, t->cur_core)) {
@@ -1194,15 +1291,11 @@ void kern_sched_report(uint64_t frame) {
         r->sl_n = t->sl_n, r->sl_req = t->sl_req, r->sl_act = t->sl_act;
         r->sp_n = t->sp_n, r->sp_ho = t->sp_ho, r->sp_site = t->sp_site;
         r->cpu = 0;
-        HANDLE th = t->tid ? OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, t->tid) : NULL;
-        FILETIME a, b, k, u;
-        if (th && GetThreadTimes(th, &a, &b, &k, &u)) {
-            uint64_t c = (((uint64_t)k.dwHighDateTime << 32 | k.dwLowDateTime) +
-                          ((uint64_t)u.dwHighDateTime << 32 | u.dwLowDateTime)) * 100;
+        uint64_t c = plat_thread_cpu_ns(t->tid);
+        if (c) {
             r->cpu = t->cpu_last ? c - t->cpu_last : 0;
             t->cpu_last = c;
         }
-        if (th) CloseHandle(th);
     }
     for (int k = 0; k < 2; k++) {
         const WaitRec *src = k ? g_mw : g_rw;
@@ -1311,10 +1404,10 @@ static void lock_acquire_for(RtThread *t, uint64_t addr, uint32_t tag) {
 // ---- threads
 static RtThread *thr_new(int prio, int core, uint64_t mask) {
     RtThread *t = calloc(1, sizeof *t);
-    Cpu *c = _aligned_malloc(sizeof(Cpu), 64);
+    Cpu *c = plat_aligned_alloc(sizeof(Cpu), 64);
     if (!t || !c) rt_fatal("kernel: thread allocation");
     memset(c, 0, sizeof *c);
-    InitializeConditionVariable(&t->cv);
+    plat_cond_init(&t->cv);
     t->prio = prio;
     t->core = core;
     t->mask = mask;
@@ -1347,22 +1440,20 @@ static void thr_free(RtThread *t) {   // holding G; t has exited and its handle 
         }
     mem_kernel_free(t->tlr, TLR_SIZE + THREAD_OBJ_SIZE);
     mem_kernel_free(t->tls, TLS_SIZE);
-    _aligned_free(t->cpu);
+    plat_aligned_free(t->cpu);
     free(t);
 }
 
 // The end of every guest thread, on its own host context after the unwind: give the core up, signal the thread
 // object, free it if its handle is already closed. t is not touched after the unlock.
 static void thread_finish(RtThread *t) {
-    if (t->timer) CloseHandle(t->timer);
-    t->timer = NULL;
-    if (t->base_fiber) ConvertFiberToThread();
+    if (t->base_fiber) plat_fiber_unconvert();
     t->base_fiber = NULL;
     tcur = NULL;
     lock();
     core_put(t);
     acct(t, S_OFF);
-    if (t->hthr) CloseHandle(t->hthr);   // no waiter interrupts a thread without a core
+    plat_thread_ref_close(t->hthr);   // no waiter interrupts a thread without a core
     t->hthr = NULL;
     t->exited = 1;
     wake_sync_waiters();
@@ -1376,22 +1467,22 @@ static void thread_finish(RtThread *t) {
 static __attribute__((noreturn)) void exit_now(RtThread *t) { longjmp(t->exit_jmp, 1); }
 
 // The calling host thread, for ap_try (TOTK_ASYNC_PREEMPT only).
-static HANDLE ap_open_self(void) {
+static PlatThreadRef *ap_open_self(void) {
     if (!cores_enabled() || !g_ap_int) return NULL;
-    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION,
-                          FALSE, GetCurrentThreadId());
-    if (!h) rt_log("kernel: OpenThread for asynchronous preemption failed (error %lu)", GetLastError());
+    PlatThreadRef *h = plat_thread_ref_self();
+    if (!h) rt_log("kernel: no reference to the thread for asynchronous preemption (error %u)", plat_last_error());
     return h;
 }
 
-static DWORD WINAPI thread_main(void *p) {
+static void thread_main(void *p) {
     RtThread *t = p;
+    plat_thread_signals();
     tcur = t;
-    t->tid = GetCurrentThreadId();
-    HANDLE self = ap_open_self();
+    t->tid = plat_thread_id();
+    PlatThreadRef *self = ap_open_self();
     lock();
     t->hthr = self;
-    while (!t->started) SleepConditionVariableSRW(&t->cv, &G, INFINITE, 0);
+    while (!t->started) plat_cond_wait(&t->cv, &G);
     core_take(t);
     unlock();
     Cpu *c = t->cpu;
@@ -1403,7 +1494,6 @@ static DWORD WINAPI thread_main(void *p) {
                  ldr_describe(t->entry, d, sizeof d));
     }
     thread_finish(tcur);
-    return 0;
 }
 
 uint64_t kern_threads_created(void) {
@@ -1424,17 +1514,17 @@ uint32_t kern_main_thread(Cpu **cpu) {
     if (g_main) rt_fatal("kern_main_thread: the main thread already runs on another host thread");
     const RtGuestLayout *L = mem_layout();
     uint64_t stack = L->stack.base + L->stack.size - MAIN_STACK;
-    if (!VirtualAlloc((void *)(uintptr_t)stack, MAIN_STACK, MEM_COMMIT, PAGE_READWRITE))
-        rt_fatal("kernel: commit the main thread stack at %#llx failed (error %lu)", (unsigned long long)stack,
-                 GetLastError());
+    if (!plat_mem_commit(stack, MAIN_STACK))
+        rt_fatal("kernel: commit the main thread stack at %#llx failed (error %u)", (unsigned long long)stack,
+                 plat_last_error());
     RtThread *t = thr_new(MAIN_PRIO, MAIN_CORE, 7);
     t->started = 1;
     t->is_main = 1;
     t->stack_top = stack + MAIN_STACK;
     t->cpu->sp = t->stack_top;
-    t->tid = GetCurrentThreadId();
+    t->tid = plat_thread_id();
     perf_main_thread();
-    HANDLE self = ap_open_self();
+    PlatThreadRef *self = ap_open_self();
     lock();
     t->hthr = self;
     thr_link(t);
@@ -1453,20 +1543,19 @@ void kern_main_stack(uint64_t *base, uint64_t *size) {
     *size = b ? MAIN_STACK : 0;
 }
 
-static DWORD WINAPI guest_main(void *p) {
+static void guest_main(void *p) {
+    plat_thread_signals();
     void (*fn)(Cpu *) = (void (*)(Cpu *))p;
     Cpu *c;
     kern_main_thread(&c);
     if (!setjmp(tcur->exit_jmp)) fn(c);
     thread_finish(tcur);
-    return 0;
 }
 
 void kern_run_on_guest_main(void (*fn)(Cpu *c)) {
-    HANDLE h = CreateThread(NULL, HOST_STACK, guest_main, (void *)fn, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-    if (!h) rt_fatal("kernel: CreateThread for the guest main thread failed (error %lu)", GetLastError());
-    WaitForSingleObject(h, INFINITE);
-    CloseHandle(h);
+    PlatThread *h = plat_thread_new_stack(guest_main, (void *)fn, NULL, HOST_STACK);
+    if (!h) rt_fatal("kernel: starting the guest main thread failed (error %u)", plat_last_error());
+    plat_thread_join(h);
 }
 
 // The high-resolution waitable timer ends a wait 0.3-0.5 ms late at best: the SDK's 20 us polling sleeps (main thread
@@ -1477,20 +1566,11 @@ void kern_run_on_guest_main(void (*fn)(Cpu *c)) {
 static void sleep_ns(RtThread *t, int64_t ns) {
     if (ns <= SLEEP_SPIN_NS) {
         uint64_t end = kern_now_ns() + (uint64_t)ns;
-        while (kern_now_ns() < end) YieldProcessor();
+        while (kern_now_ns() < end) _mm_pause();
         return;
     }
-    if (!t->timer) {
-        t->timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-        if (!t->timer) t->timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
-        if (!t->timer) rt_fatal("kernel: CreateWaitableTimerExW failed (error %lu)", GetLastError());
-    }
-    LARGE_INTEGER due;
-    int64_t units = ns / 100 + (ns % 100 != 0);   // 100 ns units, rounded up
-    due.QuadPart = -(units > 0 ? units : 1);
-    if (!SetWaitableTimer(t->timer, &due, 0, NULL, NULL, FALSE))
-        rt_fatal("kernel: SetWaitableTimer failed (error %lu)", GetLastError());
-    WaitForSingleObject(t->timer, INFINITE);
+    (void)t;
+    plat_wait_ns((uint64_t)ns);
 }
 
 // ---- synchronization objects
@@ -1579,9 +1659,9 @@ int kern_svc(Cpu *c, uint32_t imm) {
         lock();
         thr_link(t);
         unlock();
-        HANDLE h = CreateThread(NULL, HOST_STACK, thread_main, t, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-        if (!h) rt_fatal("kernel: CreateThread failed (error %lu)", GetLastError());
-        CloseHandle(h);
+        PlatThread *h = plat_thread_new_stack(thread_main, t, NULL, HOST_STACK);
+        if (!h) rt_fatal("kernel: starting a thread failed (error %u)", plat_last_error());
+        plat_thread_detach(h);
         if (rt_trace & RT_TRACE_SVC) {
             char d[128];
             rt_log("CreateThread %#x entry %s stack %#llx prio %d core %d", t->handle,
@@ -1596,7 +1676,7 @@ int kern_svc(Cpu *c, uint32_t imm) {
         RtThread *t = h_get((uint32_t)x[0], O_THREAD);
         if (t) {
             t->started = 1;
-            WakeConditionVariable(&t->cv);
+            plat_cond_signal(&t->cv);
         }
         unlock();
         x[0] = t ? R_OK : R_BAD_HANDLE;
@@ -1609,7 +1689,7 @@ int kern_svc(Cpu *c, uint32_t imm) {
             t->leaving = t->fiber;
             t->fiber = NULL;
             t->cur = t->cpu;
-            SwitchToFiber(t->base_fiber);
+            plat_fiber_switch(t->base_fiber);
             rt_fatal("kernel: ExitThread on a fiber came back");
         }
         exit_now(t);
@@ -1646,7 +1726,7 @@ int kern_svc(Cpu *c, uint32_t imm) {
             core_take(t);
         }
         unlock();
-        if (!give) SwitchToThread();
+        if (!give) plat_yield();
         return 1;
     }
     case 0x0C: {   // GetThreadPriority(w1 handle -> w1)
@@ -1657,7 +1737,7 @@ int kern_svc(Cpu *c, uint32_t imm) {
         unlock();
         return 1;
     }
-    case 0x0D: {   // SetThreadPriority(w0 handle, w1 priority)
+    case 0x0D: {   // plat_thread_priority(w0 handle, w1 priority)
         if ((uint32_t)x[1] < 28 || (uint32_t)x[1] > 59) {
             x[0] = R_BAD_STATE;
             return 1;
@@ -1999,14 +2079,14 @@ void kern_event_signal(uint32_t hw) {
 // guest thread; the writable handle is kept, so any thread (host audio tick included) can signal it later.
 static struct { uint64_t ev; uint32_t wh; } g_se[512];
 static int g_nse;
-static SRWLOCK g_se_lock = SRWLOCK_INIT;
+static PlatMutex g_se_lock = PLAT_MUTEX_INIT;
 
 static uint32_t se_find(uint64_t ev) {
-    AcquireSRWLockShared(&g_se_lock);
+    plat_mutex_lock_shared(&g_se_lock);
     uint32_t wh = 0;
     for (int i = 0; i < g_nse && !wh; i++)
         if (g_se[i].ev == ev) wh = g_se[i].wh;
-    ReleaseSRWLockShared(&g_se_lock);
+    plat_mutex_unlock_shared(&g_se_lock);
     return wh;
 }
 
@@ -2022,11 +2102,11 @@ void kern_bind_system_event(Cpu *c, uint64_t ev, int autoclear) {
     uint32_t r = (uint32_t)rt_call(c, create, 3, ev, (uint64_t)(autoclear ? 1 : 0), (uint64_t)1);
     if (r) rt_fatal("kern_bind_system_event: CreateSystemEvent(%#llx) failed %#x", (unsigned long long)ev, r);
     uint32_t wh = (uint32_t)rt_call(c, getw, 1, ev);
-    AcquireSRWLockExclusive(&g_se_lock);
+    plat_mutex_lock(&g_se_lock);
     if (g_nse == (int)(sizeof g_se / sizeof *g_se)) rt_fatal("kern_bind_system_event: table full");
     g_se[g_nse].ev = ev;
     g_se[g_nse++].wh = wh;
-    ReleaseSRWLockExclusive(&g_se_lock);
+    plat_mutex_unlock(&g_se_lock);
 }
 
 // An event not bound yet is bound on the spot with manual clear, which needs a guest thread.
@@ -2048,19 +2128,19 @@ enum { F_NEW, F_STARTED, F_DONE };
 struct Fiber {
     uint64_t addr, func, arg, stack, size;
     Cpu *cpu;
-    void *host;
+    PlatFiber *host;
     int state;
     volatile int running;
 };
 static Fiber *g_fibers[FIBER_MAX];
-static SRWLOCK g_fiber_lock = SRWLOCK_INIT;
+static PlatMutex g_fiber_lock = PLAT_MUTEX_INIT;
 
 static Fiber *fiber_find(uint64_t addr) {
     Fiber *f = NULL;
-    AcquireSRWLockShared(&g_fiber_lock);
+    plat_mutex_lock_shared(&g_fiber_lock);
     for (int i = 0; i < FIBER_MAX && !f; i++)
         if (g_fibers[i] && g_fibers[i]->addr == addr) f = g_fibers[i];
-    ReleaseSRWLockShared(&g_fiber_lock);
+    plat_mutex_unlock_shared(&g_fiber_lock);
     return f;
 }
 
@@ -2077,7 +2157,7 @@ static void fiber_resumed(void) {
     if (t->exit_pending && !t->fiber) exit_now(t);
 }
 
-static void WINAPI fiber_main(void *p) {
+static void fiber_main(void *p) {
     Fiber *f = p;
     fiber_resumed();
     Cpu *c = f->cpu;
@@ -2094,8 +2174,8 @@ static void WINAPI fiber_main(void *p) {
 
 static void fiber_switch_to(RtThread *t, const Cpu *from, Fiber *to) {
     if (!t->base_fiber) {
-        t->base_fiber = ConvertThreadToFiberEx(NULL, FIBER_FLAG_FLOAT_SWITCH);
-        if (!t->base_fiber) rt_fatal("kernel: ConvertThreadToFiberEx failed (error %lu)", GetLastError());
+        t->base_fiber = plat_fiber_convert();
+        if (!t->base_fiber) rt_fatal("kernel: converting the thread to a fiber failed (error %u)", plat_last_error());
     }
     Cpu *dst = to ? to->cpu : t->cpu;
     if (to) {
@@ -2118,7 +2198,7 @@ static void fiber_switch_to(RtThread *t, const Cpu *from, Fiber *to) {
     t->fiber = to;
     t->cur = dst;
     int depth = t->host_depth;
-    SwitchToFiber(to ? to->host : t->base_fiber);
+    plat_fiber_switch(to ? to->host : t->base_fiber);
     t->host_depth = depth;
     fiber_resumed();
 }
@@ -2130,17 +2210,17 @@ void kern_fiber_initialize(Cpu *c) {
     if (f && f->running) rt_fatal("InitializeFiber(%#llx): the fiber is running", (unsigned long long)addr);
     if (!f) {
         f = calloc(1, sizeof *f);
-        Cpu *fc = _aligned_malloc(sizeof(Cpu), 64);
+        Cpu *fc = plat_aligned_alloc(sizeof(Cpu), 64);
         if (!f || !fc) rt_fatal("kernel: fiber allocation");
         f->cpu = fc;
-        AcquireSRWLockExclusive(&g_fiber_lock);
+        plat_mutex_lock(&g_fiber_lock);
         int i = 0;
         while (i < FIBER_MAX && g_fibers[i]) i++;
         if (i == FIBER_MAX) rt_fatal("kernel: more than %d fibers", FIBER_MAX);
         g_fibers[i] = f;
-        ReleaseSRWLockExclusive(&g_fiber_lock);
+        plat_mutex_unlock(&g_fiber_lock);
     } else if (f->host) {
-        DeleteFiber(f->host);
+        plat_fiber_delete(f->host);
     }
     memset(f->cpu, 0, sizeof *f->cpu);
     f->cpu->excl_addr = ~0ull;
@@ -2151,25 +2231,25 @@ void kern_fiber_initialize(Cpu *c) {
     f->size = c->x[4];
     f->state = F_NEW;
     f->running = 0;
-    f->host = CreateFiberEx(0x10000, HOST_STACK, FIBER_FLAG_FLOAT_SWITCH, fiber_main, f);
-    if (!f->host) rt_fatal("kernel: CreateFiberEx failed (error %lu)", GetLastError());
+    f->host = plat_fiber_new(HOST_STACK, fiber_main, f);
+    if (!f->host) rt_fatal("kernel: creating a fiber failed (error %u)", plat_last_error());
 }
 
 // FinalizeFiber(x0 FiberType*)
 void kern_fiber_finalize(Cpu *c) {
     uint64_t addr = c->x[0];
-    AcquireSRWLockExclusive(&g_fiber_lock);
+    plat_mutex_lock(&g_fiber_lock);
     Fiber *f = NULL;
     for (int i = 0; i < FIBER_MAX && !f; i++)
         if (g_fibers[i] && g_fibers[i]->addr == addr) {
             f = g_fibers[i];
             g_fibers[i] = NULL;
         }
-    ReleaseSRWLockExclusive(&g_fiber_lock);
+    plat_mutex_unlock(&g_fiber_lock);
     if (!f) rt_fatal("FinalizeFiber(%#llx): not an initialized fiber", (unsigned long long)addr);
     if (f->running) rt_fatal("FinalizeFiber(%#llx): the fiber is running", (unsigned long long)addr);
-    DeleteFiber(f->host);
-    _aligned_free(f->cpu);
+    plat_fiber_delete(f->host);
+    plat_aligned_free(f->cpu);
     free(f);
 }
 
@@ -2193,3 +2273,392 @@ HOST_OVERRIDE(KERN_SYM_INITIALIZE_FIBER, kern_fiber_initialize);
 HOST_OVERRIDE(KERN_SYM_FINALIZE_FIBER, kern_fiber_finalize);
 HOST_OVERRIDE(KERN_SYM_SWITCH_TO_FIBER, kern_fiber_switch);
 HOST_OVERRIDE(KERN_SYM_GET_CURRENT_FIBER, kern_fiber_current);
+
+// ---- --probe-preempt: the interruption against a loop that notices anything it did not do itself
+// ap_probe_spin loads every general register, YMM0-15, ZF, CF and (System V) its red zone with known values, spins with
+// instructions that change none of them, and checks them all. Any register kern_ap_stub fails to keep shows as a count
+// in ap_probe_fails, including one the interruption's own machinery clobbers.
+void ap_probe_spin(void);
+extern char ap_probe_lo[], ap_probe_hi[];
+volatile int32_t ap_probe_stop, ap_probe_fails;
+__asm__(
+        ".text\n"
+        ".globl ap_probe_spin\n"
+        ".p2align 4\n"
+        "ap_probe_spin:\n"
+        "    pushq %rbx\n"
+        "    pushq %rbp\n"
+        "    pushq %r12\n"
+        "    pushq %r13\n"
+        "    pushq %r14\n"
+        "    pushq %r15\n"
+#ifdef _WIN32
+        "    pushq %rdi\n"
+        "    pushq %rsi\n"
+        "    subq $168, %rsp\n"
+        "    vmovdqu %xmm6, 0(%rsp)\n"
+        "    vmovdqu %xmm7, 16(%rsp)\n"
+        "    vmovdqu %xmm8, 32(%rsp)\n"
+        "    vmovdqu %xmm9, 48(%rsp)\n"
+        "    vmovdqu %xmm10, 64(%rsp)\n"
+        "    vmovdqu %xmm11, 80(%rsp)\n"
+        "    vmovdqu %xmm12, 96(%rsp)\n"
+        "    vmovdqu %xmm13, 112(%rsp)\n"
+        "    vmovdqu %xmm14, 128(%rsp)\n"
+        "    vmovdqu %xmm15, 144(%rsp)\n"
+#endif
+        ".globl ap_probe_lo\n"
+        "ap_probe_lo:\n"
+        ".Lap_round:\n"
+        "    movabsq $0x202020202020202, %rax\n"
+        "    vmovq %rax, %xmm0\n"
+        "    vpbroadcastq %xmm0, %ymm0\n"
+        "    movabsq $0x404040404040405, %rax\n"
+        "    vmovq %rax, %xmm1\n"
+        "    vpbroadcastq %xmm1, %ymm1\n"
+        "    movabsq $0x606060606060608, %rax\n"
+        "    vmovq %rax, %xmm2\n"
+        "    vpbroadcastq %xmm2, %ymm2\n"
+        "    movabsq $0x80808080808080b, %rax\n"
+        "    vmovq %rax, %xmm3\n"
+        "    vpbroadcastq %xmm3, %ymm3\n"
+        "    movabsq $0xa0a0a0a0a0a0a0e, %rax\n"
+        "    vmovq %rax, %xmm4\n"
+        "    vpbroadcastq %xmm4, %ymm4\n"
+        "    movabsq $0xc0c0c0c0c0c0c11, %rax\n"
+        "    vmovq %rax, %xmm5\n"
+        "    vpbroadcastq %xmm5, %ymm5\n"
+        "    movabsq $0xe0e0e0e0e0e0e14, %rax\n"
+        "    vmovq %rax, %xmm6\n"
+        "    vpbroadcastq %xmm6, %ymm6\n"
+        "    movabsq $0x1010101010101017, %rax\n"
+        "    vmovq %rax, %xmm7\n"
+        "    vpbroadcastq %xmm7, %ymm7\n"
+        "    movabsq $0x121212121212121a, %rax\n"
+        "    vmovq %rax, %xmm8\n"
+        "    vpbroadcastq %xmm8, %ymm8\n"
+        "    movabsq $0x141414141414141d, %rax\n"
+        "    vmovq %rax, %xmm9\n"
+        "    vpbroadcastq %xmm9, %ymm9\n"
+        "    movabsq $0x1616161616161620, %rax\n"
+        "    vmovq %rax, %xmm10\n"
+        "    vpbroadcastq %xmm10, %ymm10\n"
+        "    movabsq $0x1818181818181823, %rax\n"
+        "    vmovq %rax, %xmm11\n"
+        "    vpbroadcastq %xmm11, %ymm11\n"
+        "    movabsq $0x1a1a1a1a1a1a1a26, %rax\n"
+        "    vmovq %rax, %xmm12\n"
+        "    vpbroadcastq %xmm12, %ymm12\n"
+        "    movabsq $0x1c1c1c1c1c1c1c29, %rax\n"
+        "    vmovq %rax, %xmm13\n"
+        "    vpbroadcastq %xmm13, %ymm13\n"
+        "    movabsq $0x1e1e1e1e1e1e1e2c, %rax\n"
+        "    vmovq %rax, %xmm14\n"
+        "    vpbroadcastq %xmm14, %ymm14\n"
+        "    movabsq $0x202020202020202f, %rax\n"
+        "    vmovq %rax, %xmm15\n"
+        "    vpbroadcastq %xmm15, %ymm15\n"
+        "    movabsq $0x1010101010101010, %rax\n"
+        "    movabsq $0x2020202020202021, %rbx\n"
+        "    movabsq $0x3030303030303032, %rdx\n"
+        "    movabsq $0x4040404040404043, %rsi\n"
+        "    movabsq $0x5050505050505054, %rdi\n"
+        "    movabsq $0x6060606060606065, %rbp\n"
+        "    movabsq $0x7070707070707076, %r8\n"
+        "    movabsq $0x8080808080808087, %r9\n"
+        "    movabsq $0x9090909090909098, %r10\n"
+        "    movabsq $0xa0a0a0a0a0a0a0a9, %r11\n"
+        "    movabsq $0xb0b0b0b0b0b0b0ba, %r12\n"
+        "    movabsq $0xc0c0c0c0c0c0c0cb, %r13\n"
+        "    movabsq $0xd0d0d0d0d0d0d0dc, %r14\n"
+        "    movabsq $0xe0e0e0e0e0e0e0ed, %r15\n"
+#ifndef _WIN32   // the red zone: below the stack pointer, and this code calls nothing
+        "    movq %rbx, -8(%rsp)\n"
+        "    movq %rbx, -64(%rsp)\n"
+        "    movq %rbx, -128(%rsp)\n"
+#endif
+        "    cmpq %rax, %rax\n"
+        "    stc\n"
+        "    movl $20000, %ecx\n"
+        ".Lap_spin:\n"
+        "    leaq -1(%rcx), %rcx\n"
+        "    jrcxz .Lap_check\n"
+        "    pause\n"
+        "    jmp .Lap_spin\n"
+        ".Lap_check:\n"
+        "    jnc .Lap_bad\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0x1010101010101010, %rcx\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0x2020202020202021, %rcx\n"
+        "    cmpq %rcx, %rbx\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0x3030303030303032, %rcx\n"
+        "    cmpq %rcx, %rdx\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0x4040404040404043, %rcx\n"
+        "    cmpq %rcx, %rsi\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0x5050505050505054, %rcx\n"
+        "    cmpq %rcx, %rdi\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0x6060606060606065, %rcx\n"
+        "    cmpq %rcx, %rbp\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0x7070707070707076, %rcx\n"
+        "    cmpq %rcx, %r8\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0x8080808080808087, %rcx\n"
+        "    cmpq %rcx, %r9\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0x9090909090909098, %rcx\n"
+        "    cmpq %rcx, %r10\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0xa0a0a0a0a0a0a0a9, %rcx\n"
+        "    cmpq %rcx, %r11\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0xb0b0b0b0b0b0b0ba, %rcx\n"
+        "    cmpq %rcx, %r12\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0xc0c0c0c0c0c0c0cb, %rcx\n"
+        "    cmpq %rcx, %r13\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0xd0d0d0d0d0d0d0dc, %rcx\n"
+        "    cmpq %rcx, %r14\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0xe0e0e0e0e0e0e0ed, %rcx\n"
+        "    cmpq %rcx, %r15\n"
+        "    jne .Lap_bad\n"
+#ifndef _WIN32
+        "    movabsq $0x2020202020202021, %rcx\n"
+        "    cmpq %rcx, -8(%rsp)\n"
+        "    jne .Lap_bad\n"
+        "    cmpq %rcx, -64(%rsp)\n"
+        "    jne .Lap_bad\n"
+        "    cmpq %rcx, -128(%rsp)\n"
+        "    jne .Lap_bad\n"
+#endif
+        "    movabsq $0x202020202020202, %rcx\n"
+        "    vmovq %xmm0, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    vextracti128 $1, %ymm0, %xmm0\n"
+        "    vmovq %xmm0, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0x404040404040405, %rcx\n"
+        "    vmovq %xmm1, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    vextracti128 $1, %ymm1, %xmm1\n"
+        "    vmovq %xmm1, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0x606060606060608, %rcx\n"
+        "    vmovq %xmm2, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    vextracti128 $1, %ymm2, %xmm2\n"
+        "    vmovq %xmm2, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0x80808080808080b, %rcx\n"
+        "    vmovq %xmm3, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    vextracti128 $1, %ymm3, %xmm3\n"
+        "    vmovq %xmm3, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0xa0a0a0a0a0a0a0e, %rcx\n"
+        "    vmovq %xmm4, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    vextracti128 $1, %ymm4, %xmm4\n"
+        "    vmovq %xmm4, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0xc0c0c0c0c0c0c11, %rcx\n"
+        "    vmovq %xmm5, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    vextracti128 $1, %ymm5, %xmm5\n"
+        "    vmovq %xmm5, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0xe0e0e0e0e0e0e14, %rcx\n"
+        "    vmovq %xmm6, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    vextracti128 $1, %ymm6, %xmm6\n"
+        "    vmovq %xmm6, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0x1010101010101017, %rcx\n"
+        "    vmovq %xmm7, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    vextracti128 $1, %ymm7, %xmm7\n"
+        "    vmovq %xmm7, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0x121212121212121a, %rcx\n"
+        "    vmovq %xmm8, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    vextracti128 $1, %ymm8, %xmm8\n"
+        "    vmovq %xmm8, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0x141414141414141d, %rcx\n"
+        "    vmovq %xmm9, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    vextracti128 $1, %ymm9, %xmm9\n"
+        "    vmovq %xmm9, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0x1616161616161620, %rcx\n"
+        "    vmovq %xmm10, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    vextracti128 $1, %ymm10, %xmm10\n"
+        "    vmovq %xmm10, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0x1818181818181823, %rcx\n"
+        "    vmovq %xmm11, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    vextracti128 $1, %ymm11, %xmm11\n"
+        "    vmovq %xmm11, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0x1a1a1a1a1a1a1a26, %rcx\n"
+        "    vmovq %xmm12, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    vextracti128 $1, %ymm12, %xmm12\n"
+        "    vmovq %xmm12, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0x1c1c1c1c1c1c1c29, %rcx\n"
+        "    vmovq %xmm13, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    vextracti128 $1, %ymm13, %xmm13\n"
+        "    vmovq %xmm13, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0x1e1e1e1e1e1e1e2c, %rcx\n"
+        "    vmovq %xmm14, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    vextracti128 $1, %ymm14, %xmm14\n"
+        "    vmovq %xmm14, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    movabsq $0x202020202020202f, %rcx\n"
+        "    vmovq %xmm15, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        "    vextracti128 $1, %ymm15, %xmm15\n"
+        "    vmovq %xmm15, %rax\n"
+        "    cmpq %rcx, %rax\n"
+        "    jne .Lap_bad\n"
+        ".Lap_next:\n"
+        "    cmpl $0, ap_probe_stop(%rip)\n"
+        "    je .Lap_round\n"
+        ".globl ap_probe_hi\n"
+        "ap_probe_hi:\n"
+        "    vzeroupper\n"
+#ifdef _WIN32
+        "    vmovdqu 0(%rsp), %xmm6\n"
+        "    vmovdqu 16(%rsp), %xmm7\n"
+        "    vmovdqu 32(%rsp), %xmm8\n"
+        "    vmovdqu 48(%rsp), %xmm9\n"
+        "    vmovdqu 64(%rsp), %xmm10\n"
+        "    vmovdqu 80(%rsp), %xmm11\n"
+        "    vmovdqu 96(%rsp), %xmm12\n"
+        "    vmovdqu 112(%rsp), %xmm13\n"
+        "    vmovdqu 128(%rsp), %xmm14\n"
+        "    vmovdqu 144(%rsp), %xmm15\n"
+        "    addq $168, %rsp\n"
+        "    popq %rsi\n"
+        "    popq %rdi\n"
+#endif
+        "    popq %r15\n"
+        "    popq %r14\n"
+        "    popq %r13\n"
+        "    popq %r12\n"
+        "    popq %rbp\n"
+        "    popq %rbx\n"
+        "    ret\n"
+        ".Lap_bad:\n"
+        "    lock incl ap_probe_fails(%rip)\n"
+        "    jmp .Lap_next\n"
+        );
+
+static RtThread ap_probe_thread;
+static uint8_t ap_probe_tlr[0x200];
+static PlatThreadRef *volatile ap_probe_ref;
+
+static void ap_probe_main(void *arg) {
+    (void)arg;
+    plat_thread_signals();
+    tcur = &ap_probe_thread;
+    ap_probe_ref = plat_thread_ref_self();
+    ap_probe_spin();
+    tcur = NULL;
+}
+
+// Interrupts the loop every 200 us for seconds, and returns how many redirects its stub completed meanwhile.
+static uint64_t ap_probe_round(double seconds) {
+    uint64_t y0 = __atomic_load_n(&g_ap_yields, __ATOMIC_RELAXED), end = plat_now_ns() + (uint64_t)(seconds * 1e9);
+    while (plat_now_ns() < end) {
+        plat_thread_interrupt(ap_probe_ref, &ap_probe_thread);
+        plat_wait_ns(200000);
+    }
+    plat_sleep_ms(20);   // what is still in flight
+    return __atomic_load_n(&g_ap_yields, __ATOMIC_RELAXED) - y0;
+}
+
+int probe_preempt(void) {
+    g_ap = g_ap_int = 1;
+    g_gen_lo = (uintptr_t)ap_probe_lo;
+    g_gen_hi = (uintptr_t)ap_probe_hi;
+    plat_interrupt_init(ap_decide);
+    ap_probe_thread.tlr = ap_probe_tlr;
+    PlatThread *t = plat_thread_new(ap_probe_main, NULL, "preempt-probe");
+    if (!t) rt_fatal("probe-preempt: no thread");
+    while (!ap_probe_ref) plat_yield();
+    int bad = 0;
+    uint64_t taken = ap_probe_round(3);
+    printf("interrupted game-like code: %llu redirects through kern_ap_stub, %d register, flag or red zone changes\n",
+           (unsigned long long)taken, ap_probe_fails);
+    if (taken < 1000 || ap_probe_fails) bad = 1;
+    // In a host call: left alone.
+    __atomic_store_n(&ap_probe_thread.host_depth, 1, __ATOMIC_RELAXED);
+    uint64_t in_host = ap_probe_round(0.3);
+    __atomic_store_n(&ap_probe_thread.host_depth, 0, __ATOMIC_RELAXED);
+    printf("in a host call: %llu redirects (want 0)\n", (unsigned long long)in_host);
+    if (in_host) bad = 1;
+    // With preemption disabled by the SDK's spin lock: left alone and asked to switch at SVC 0x36.
+    volatile uint16_t *tl = ap_tlr(&ap_probe_thread);
+    tl[0] = 1;
+    tl[1] = 0;
+    uint64_t disabled = ap_probe_round(0.3);
+    int flagged = tl[1];
+    tl[0] = 0;
+    printf("preemption disabled: %llu redirects (want 0), interrupt flag %d (want 1)\n", (unsigned long long)disabled, flagged);
+    if (disabled || !flagged) bad = 1;
+    uint64_t again = ap_probe_round(0.5);
+    printf("afterwards: %llu redirects\n", (unsigned long long)again);
+    if (!again) bad = 1;
+    __atomic_store_n(&ap_probe_stop, 1, __ATOMIC_SEQ_CST);
+    plat_thread_join(t);
+    if (ap_probe_fails) bad = 1;
+    printf("probe-preempt: %s (%d changes)\n", bad ? "FAILED" : "passed", ap_probe_fails);
+    return bad;
+}

@@ -3,8 +3,7 @@
 // The SVC entry of the lifted code: preemption checkpoint, trace, then the thread and
 // synchronization SVCs (kernel.c), IPC (ipc.c), memory (memory.c), Break, OutputDebugString, GetInfo and ExitProcess. The 21 SVCs
 // TotK has but never reaches on MNG's boot path stop with a named fatal, the caller and the guest backtrace.
-#include <windows.h>
-#include <bcrypt.h>
+#include "platform/platform.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -27,10 +26,8 @@ RtStats rt_stats(void) {
 }
 
 static int readable(uint64_t a, uint64_t n) {
-    MEMORY_BASIC_INFORMATION mbi;
-    if (!VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return 0;
-    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
-    return a + n <= (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+    uint8_t probe[64];
+    return n <= sizeof probe && plat_mem_read(a, probe, n);
 }
 
 void kern_backtrace(const Cpu *c) {
@@ -122,8 +119,7 @@ static void get_info(Cpu *c, uint64_t pc) {
     case 8: v = 0; break;                       // debugger attached
     case 10: v = 0; break;                      // idle tick count
     case 11:                                    // random entropy
-        if (BCryptGenRandom(NULL, (PUCHAR)&v, sizeof v, BCRYPT_USE_SYSTEM_PREFERRED_RNG))
-            rt_fatal("GetInfo 11: BCryptGenRandom failed");
+        if (!plat_random(&v, sizeof v)) rt_fatal("GetInfo 11: no random bytes from the system");
         break;
     case 18: v = PROGRAM_ID; break;
     case 20: v = user_exception_context(); break;   // the SDK keeps e.g. the dying message at +0x1C0
@@ -226,7 +222,7 @@ static void svc_body(Cpu *c, uint32_t imm, uint64_t pc) {
         prof_write();
         fflush(NULL);
         if (svc_test_exit_hook) return svc_test_exit_hook(0);
-        ExitProcess(0);
+        plat_exit_now(0);
     }
     }
     svc_fatal(c, imm, pc, "not implemented");

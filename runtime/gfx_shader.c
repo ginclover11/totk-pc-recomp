@@ -33,8 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
-
+#include "platform/platform.h"
 #include "cfg.h"
 #include "gfx.h"
 #include "host.h"
@@ -84,10 +83,10 @@ struct GfxShader {
     uint32_t local[3];
 };
 
-static SRWLOCK cache_lock = SRWLOCK_INIT;                  // memory cache
+static PlatMutex cache_lock = PLAT_MUTEX_INIT;                  // memory cache
 static GfxShader *buckets[BUCKETS];
 static UseEnt *use_buckets[BUCKETS];                       // under cache_lock
-static volatile LONG64 n_requests, n_hits, n_failures, n_keys, n_xlated;   // n_keys: memory cache entries
+static volatile int64_t n_requests, n_hits, n_failures, n_keys, n_xlated;   // n_keys: memory cache entries
 
 typedef struct {                                           // one translator child
     PlatChild *child;                                      // NULL: not started
@@ -97,18 +96,18 @@ typedef struct {                                           // one translator chi
 } Svc;
 
 static struct {
-    SRWLOCK lock;
-    CONDITION_VARIABLE freed;
+    PlatMutex lock;
+    PlatCond freed;
     int limit;                                             // children in use at most (0: svc_runtime_limit)
     Svc s[MAX_SVC];
-} S = {SRWLOCK_INIT, CONDITION_VARIABLE_INIT};
+} S = {PLAT_MUTEX_INIT, PLAT_COND_INIT};
 
 static struct {                                            // translations in flight: cache key, or code hash while the
-    SRWLOCK lock;                                          // use mask is unknown; one translation per id at a time
-    CONDITION_VARIABLE done;
+    PlatMutex lock;                                          // use mask is unknown; one translation per id at a time
+    PlatCond done;
     uint8_t id[2 * MAX_SVC][32];
     int n;
-} F = {SRWLOCK_INIT, CONDITION_VARIABLE_INIT};
+} F = {PLAT_MUTEX_INIT, PLAT_COND_INIT};
 
 #define PATH_CAP 1024                                  // bytes of a UTF-8 path
 static char cache_dir[PATH_CAP];
@@ -116,7 +115,7 @@ static char xlate_exe[PATH_CAP];
 static uint8_t xlate_id[32];                               // translator identity (see the keys at the top)
 static int host_f64 = 1, host_set;                         // gfx_shader_set_host
 static uint32_t host_sbuf, host_sg[3] = {32, 32, 32};
-static INIT_ONCE paths_once = INIT_ONCE_STATIC_INIT;
+static PlatOnce paths_once = PLAT_ONCE_INIT;
 
 // ---- small helpers
 
@@ -171,7 +170,7 @@ static void xlate_identity(void) {
     } else {
         char p[PATH_CAP + 8];
         strcpy(p, xlate_exe);
-        char *dot = strrchr(p, '.'), *sep = strrchr(p, '\\');
+        char *dot = strrchr(p, '.'), *sep = strrchr(p, PLAT_SEP[0]);
         if (dot && dot > sep) *dot = 0;
         strcat(p, ".id");
         uint64_t size = 0;
@@ -193,16 +192,15 @@ static void xlate_identity(void) {
 // next to totk.exe, so every build dir has its own (as the pipeline cache, vk_pipeline.c cache_path_init).
 static void use_preload_start(void);
 
-static BOOL CALLBACK init_paths(PINIT_ONCE once, PVOID param, PVOID *ctx) {
-    (void)once, (void)param, (void)ctx;
+static void init_paths(void) {
     char exe[PATH_CAP], root[PATH_CAP] = "", exe_dir[PATH_CAP] = "";
     if (plat_exe_path(exe, sizeof exe)) {
-        char *last = strrchr(exe, '\\');
+        char *last = strrchr(exe, PLAT_SEP[0]);
         if (last) snprintf(exe_dir, sizeof exe_dir, "%.*s", (int)(last - exe), exe);
-        for (char *cut = strrchr(exe, '\\'); cut; cut = strrchr(exe, '\\')) {
+        for (char *cut = strrchr(exe, PLAT_SEP[0]); cut; cut = strrchr(exe, PLAT_SEP[0])) {
             *cut = 0;
             char probe[PATH_CAP + 32];
-            snprintf(probe, sizeof probe, "%s\\build\\xlate\\totk_xlate.exe", exe);
+            snprintf(probe, sizeof probe, "%s" PLAT_SEP "build" PLAT_SEP "xlate" PLAT_SEP "totk_xlate" PLAT_EXE_SUFFIX, exe);
             if (file_exists(probe)) {
                 strcpy(root, exe);
                 break;
@@ -211,18 +209,17 @@ static BOOL CALLBACK init_paths(PINIT_ONCE once, PVOID param, PVOID *ctx) {
     }
     const char *xlate_cfg = cfg_get("TOTK_XLATE"), *cache_cfg = cfg_get("TOTK_SHADER_CACHE");
     char beside[PATH_CAP + 32];   // a packaged folder (tools/package_build.py) keeps the translator next to totk.exe
-    if (exe_dir[0]) snprintf(beside, sizeof beside, "%s\\totk_xlate.exe", exe_dir);
+    if (exe_dir[0]) snprintf(beside, sizeof beside, "%s" PLAT_SEP "totk_xlate" PLAT_EXE_SUFFIX, exe_dir);
     if (xlate_cfg && *xlate_cfg && strlen(xlate_cfg) < sizeof xlate_exe) strcpy(xlate_exe, xlate_cfg);
     else if (exe_dir[0] && file_exists(beside)) strcpy(xlate_exe, beside);
-    else if (root[0]) snprintf(xlate_exe, sizeof xlate_exe, "%s\\build\\xlate\\totk_xlate.exe", root);
+    else if (root[0]) snprintf(xlate_exe, sizeof xlate_exe, "%s" PLAT_SEP "build" PLAT_SEP "xlate" PLAT_SEP "totk_xlate" PLAT_EXE_SUFFIX, root);
     if (cache_cfg && *cache_cfg && strlen(cache_cfg) < sizeof cache_dir) strcpy(cache_dir, cache_cfg);
-    else if (exe_dir[0]) snprintf(cache_dir, sizeof cache_dir, "%s\\shader-cache", exe_dir);
+    else if (exe_dir[0]) snprintf(cache_dir, sizeof cache_dir, "%s" PLAT_SEP "shader-cache", exe_dir);
     xlate_identity();
     use_preload_start();
-    return TRUE;
 }
 
-static void paths(void) { InitOnceExecuteOnce(&paths_once, init_paths, NULL, NULL); }
+static void paths(void) { plat_once(&paths_once, init_paths); }
 
 // Host answers (vk_caps.c, at device creation, before any translation). Answers other than the defaults (Float64,
 // exact storage offsets, 32 lanes) are mixed into the translator identity, so they get their own cache keys.
@@ -267,7 +264,7 @@ static int child_start(Svc *v) {
 // One line out, one line in (no newline in the reply). 0 when the pipe broke.
 static int child_exchange_raw(Svc *v, const char *line, char *reply, size_t reply_size) {
     if (!v->child && !child_start(v)) return 0;
-    InterlockedIncrement64(&n_requests);
+    __atomic_add_fetch(&n_requests, 1, __ATOMIC_SEQ_CST);
     size_t n = strlen(line);
     if (!plat_child_write(v->child, line, n)) return 0;
     if (!plat_child_write(v->child, "\n", 1)) return 0;
@@ -298,11 +295,11 @@ static int child_exchange(Svc *v, const char *line, char *reply, size_t reply_si
 
 // Children allowed at run time: TOTK_XLATE_PROCS, default 2.
 static int svc_runtime_limit(void) {
-    static volatile LONG n;
+    static volatile int32_t n;
     if (!n) {
         const char *e = cfg_get("TOTK_XLATE_PROCS");
         int v = e && *e ? atoi(e) : 2;
-        InterlockedExchange(&n, v < 1 ? 1 : v > MAX_SVC ? MAX_SVC : v);
+        __atomic_exchange_n(&n, v < 1 ? 1 : v > MAX_SVC ? MAX_SVC : v, __ATOMIC_SEQ_CST);
     }
     return (int)n;
 }
@@ -315,7 +312,7 @@ static int svc_used(void) {                                // caller holds S.loc
 
 // A child for one request: an idle running one, else a new slot while fewer than S.limit are in use, else waits.
 static Svc *svc_get(void) {
-    AcquireSRWLockExclusive(&S.lock);
+    plat_mutex_lock(&S.lock);
     if (!S.limit) S.limit = svc_runtime_limit();
     Svc *v;
     for (;;) {
@@ -328,42 +325,42 @@ static Svc *svc_get(void) {
         }
         if (!v && empty && svc_used() < S.limit) v = empty;
         if (v) break;
-        SleepConditionVariableSRW(&S.freed, &S.lock, INFINITE, 0);
+        plat_cond_wait(&S.freed, &S.lock);
     }
     v->busy = 1;
-    ReleaseSRWLockExclusive(&S.lock);
+    plat_mutex_unlock(&S.lock);
     return v;
 }
 
 // Returns a child; one over the limit (svc_set_limit lowered it) is stopped.
 static void svc_put(Svc *v) {
-    AcquireSRWLockExclusive(&S.lock);
+    plat_mutex_lock(&S.lock);
     int stop = v->child && svc_used() > S.limit;
     if (!stop) v->busy = 0;
-    ReleaseSRWLockExclusive(&S.lock);
+    plat_mutex_unlock(&S.lock);
     if (stop) {
         child_stop(v);
-        AcquireSRWLockExclusive(&S.lock);
+        plat_mutex_lock(&S.lock);
         v->busy = 0;
-        ReleaseSRWLockExclusive(&S.lock);
+        plat_mutex_unlock(&S.lock);
     }
-    WakeAllConditionVariable(&S.freed);
+    plat_cond_broadcast(&S.freed);
 }
 
 // Sets the number of children; idle ones over it are stopped now, busy ones when they are returned.
 static void svc_set_limit(int n) {
     Svc *stop[MAX_SVC];
     int k = 0;
-    AcquireSRWLockExclusive(&S.lock);
+    plat_mutex_lock(&S.lock);
     S.limit = n < 1 ? 1 : n > MAX_SVC ? MAX_SVC : n;
     for (int i = 0, used = svc_used(); i < MAX_SVC && used > S.limit; i++)
         if (!S.s[i].busy && S.s[i].child) S.s[i].busy = 1, stop[k++] = &S.s[i], used--;
-    ReleaseSRWLockExclusive(&S.lock);
+    plat_mutex_unlock(&S.lock);
     for (int i = 0; i < k; i++) child_stop(stop[i]);
-    AcquireSRWLockExclusive(&S.lock);
+    plat_mutex_lock(&S.lock);
     for (int i = 0; i < k; i++) stop[i]->busy = 0;
-    ReleaseSRWLockExclusive(&S.lock);
-    WakeAllConditionVariable(&S.freed);
+    plat_mutex_unlock(&S.lock);
+    plat_cond_broadcast(&S.freed);
 }
 
 // One request on a child; a dead child is restarted once. 0 when the translator is unavailable. The caller has given
@@ -379,35 +376,35 @@ static int svc_request(const char *line, char *reply, size_t reply_size) {
 
 // One translation per id at a time (F); F.id full also waits.
 static void flight_enter(const uint8_t id[32]) {
-    AcquireSRWLockExclusive(&F.lock);
+    plat_mutex_lock(&F.lock);
     for (;;) {
         int busy = F.n == 2 * MAX_SVC;
         for (int i = 0; i < F.n && !busy; i++) busy = !memcmp(F.id[i], id, 32);
         if (!busy) break;
-        SleepConditionVariableSRW(&F.done, &F.lock, INFINITE, 0);
+        plat_cond_wait(&F.done, &F.lock);
     }
     memcpy(F.id[F.n++], id, 32);
-    ReleaseSRWLockExclusive(&F.lock);
+    plat_mutex_unlock(&F.lock);
 }
 
 static void flight_leave(const uint8_t id[32]) {
-    AcquireSRWLockExclusive(&F.lock);
+    plat_mutex_lock(&F.lock);
     for (int i = 0; i < F.n; i++)
         if (!memcmp(F.id[i], id, 32)) {
             memcpy(F.id[i], F.id[--F.n], 32);
             break;
         }
-    ReleaseSRWLockExclusive(&F.lock);
-    WakeAllConditionVariable(&F.done);
+    plat_mutex_unlock(&F.lock);
+    plat_cond_broadcast(&F.done);
 }
 
 // ---- cache
 
 static GfxShader *mem_find(const uint8_t key[32]) {
-    AcquireSRWLockShared(&cache_lock);
+    plat_mutex_lock_shared(&cache_lock);
     GfxShader *s = buckets[(key[0] | key[1] << 8) % BUCKETS];
     while (s && memcmp(s->key, key, 32)) s = s->next;
-    ReleaseSRWLockShared(&cache_lock);
+    plat_mutex_unlock_shared(&cache_lock);
     return s;
 }
 
@@ -420,7 +417,7 @@ static void reflect(GfxShader *s);
 
 // Inserts s, or frees it and returns the entry another thread inserted first.
 static GfxShader *mem_insert(GfxShader *s) {
-    AcquireSRWLockExclusive(&cache_lock);
+    plat_mutex_lock(&cache_lock);
     GfxShader **head = &buckets[(s->key[0] | s->key[1] << 8) % BUCKETS], *r = *head;
     while (r && memcmp(r->key, s->key, 32)) r = r->next;
     if (r) {
@@ -431,7 +428,7 @@ static GfxShader *mem_insert(GfxShader *s) {
         *head = s;
         n_keys++;
     }
-    ReleaseSRWLockExclusive(&cache_lock);
+    plat_mutex_unlock(&cache_lock);
     return s;
 }
 
@@ -471,20 +468,20 @@ static int spirv_complete(const uint32_t *w, uint64_t n) {
 // Reads <key>.spv and <key>.res.json; NULL if either is missing or malformed (the caller translates again and
 // overwrites both). iid: the input id, NULL when the caller sets it.
 static GfxShader *disk_load(const uint8_t key[32], const uint8_t *iid) {
-    static volatile LONG n_bad;
+    static volatile int32_t n_bad;
     char hex[65], p[PATH_CAP + 80];
     key_hex(key, hex);
     uint64_t spv_size = 0, res_size = 0;
-    snprintf(p, PATH_CAP + 80, "%s\\%s.res.json", cache_dir, hex);
+    snprintf(p, PATH_CAP + 80, "%s" PLAT_SEP "%s.res.json", cache_dir, hex);
     uint8_t *res = read_file(p, &res_size);
     if (!res) return NULL;
     if (!reflection_valid((const char *)res, res_size)) {
-        LONG n = InterlockedIncrement(&n_bad);
-        if (n <= 3 || !(n & (n - 1))) rt_log("gfx_shader: %s.res.json is malformed, translating again (%ld so far)", hex, n);
+        int32_t n = __atomic_add_fetch(&n_bad, 1, __ATOMIC_SEQ_CST);
+        if (n <= 3 || !(n & (n - 1))) rt_log("gfx_shader: %s.res.json is malformed, translating again (%d so far)", hex, n);
         free(res);
         return NULL;
     }
-    snprintf(p, PATH_CAP + 80, "%s\\%s.spv", cache_dir, hex);
+    snprintf(p, PATH_CAP + 80, "%s" PLAT_SEP "%s.spv", cache_dir, hex);
     uint8_t *spv = read_file(p, &spv_size);
     uint32_t magic = 0;
     if (spv && spv_size >= 20) memcpy(&magic, spv, 4);
@@ -713,7 +710,7 @@ static void use_name(const uint8_t h[32], uint8_t name[32]) {
 static void use_path_of(const uint8_t name[32], char *p) {
     char hex[65];
     key_hex(name, hex);
-    snprintf(p, PATH_CAP + 80, "%s\\%s.use", cache_dir, hex);
+    snprintf(p, PATH_CAP + 80, "%s" PLAT_SEP "%s.use", cache_dir, hex);
 }
 
 static void use_path(const uint8_t h[32], char *p) {
@@ -729,7 +726,7 @@ static void use_path(const uint8_t h[32], char *p) {
 #define USE_FILE_BUCKETS 65536
 typedef struct UseFile { struct UseFile *next; uint8_t name[32]; UseMask m; } UseFile;
 static UseFile *use_files[USE_FILE_BUCKETS];
-static volatile LONG use_files_ready;
+static volatile int32_t use_files_ready;
 
 static UseFile **use_file_slot(const uint8_t name[32]) {
     UseFile **e = &use_files[(name[0] | name[1] << 8) % USE_FILE_BUCKETS];
@@ -747,26 +744,27 @@ static int hex_byte(const char *c) {
     return v;
 }
 
-static DWORD WINAPI use_preload(void *arg) {
+static void use_preload(void *arg) {
     (void)arg;
     uint64_t t0 = plat_now_ns();
-    char pattern[PATH_CAP + 16], p[PATH_CAP + 80];
-    snprintf(pattern, sizeof pattern, "%s\\*.use", cache_dir);
-    WIN32_FIND_DATAA fd;
-    HANDLE f = FindFirstFileExA(pattern, FindExInfoBasic, &fd, FindExSearchNameMatch, NULL, FIND_FIRST_EX_LARGE_FETCH);
+    char p[PATH_CAP + 80];
+    PlatDir *f = plat_dir_open(cache_dir);
+    PlatDirEntry fd;
     int n = 0, bad = 0;
-    if (f != INVALID_HANDLE_VALUE) {
-        do {
+    if (f) {
+        while (plat_dir_next(f, &fd)) {
+            size_t name_len = strlen(fd.name);
+            if (name_len < 4 || strcmp(fd.name + name_len - 4, ".use")) continue;
             UseFile e = {0};
-            int ok = strlen(fd.cFileName) == 68;
+            int ok = strlen(fd.name) == 68;
             for (int i = 0; ok && i < 32; i++) {
-                int v = hex_byte(fd.cFileName + 2 * i);
+                int v = hex_byte(fd.name + 2 * i);
                 ok = v >= 0, e.name[i] = (uint8_t)v;
             }
             uint64_t len = 0;
             uint32_t *u = NULL;
             if (ok) {
-                snprintf(p, sizeof p, "%s\\%s", cache_dir, fd.cFileName);
+                snprintf(p, sizeof p, "%s" PLAT_SEP "%s", cache_dir, fd.name);
                 u = (uint32_t *)read_file(p, &len);
                 ok = u && len == 20 && u[0] == USE_MAGIC && u[1] == USE_VERSION;
             }
@@ -778,19 +776,18 @@ static DWORD WINAPI use_preload(void *arg) {
                 bad++;
             }
             free(u);
-        } while (FindNextFileA(f, &fd));
-        FindClose(f);
+        }
+        plat_dir_close(f);
     }
-    InterlockedExchange(&use_files_ready, 1);
+    __atomic_exchange_n(&use_files_ready, 1, __ATOMIC_SEQ_CST);
     rt_log("gfx_shader: %d use masks read in %.0f ms on a background thread (%d unreadable)", n,
            (plat_now_ns() - t0) / 1e6, bad);
-    return 0;
 }
 
 static void use_preload_start(void) {
     if (!cache_dir[0]) return;
-    HANDLE t = CreateThread(NULL, 0, use_preload, NULL, 0, NULL);
-    if (t) SetThreadPriority(t, THREAD_PRIORITY_BELOW_NORMAL), CloseHandle(t);
+    PlatThread *t = plat_thread_new(use_preload, NULL, NULL);
+    if (t) plat_thread_priority(t, PLAT_PRIO_BELOW), plat_thread_detach(t);
 }
 
 static UseEnt **use_slot(const uint8_t h[32]) {         // caller holds cache_lock
@@ -809,15 +806,15 @@ static void use_put(const uint8_t h[32], int known, const UseMask *m) {
 
 // 1 with *m when the use mask of h is known (memory, then <hash>.use; a disk miss is remembered).
 static int use_find(const uint8_t h[32], UseMask *m) {
-    AcquireSRWLockShared(&cache_lock);
+    plat_mutex_lock_shared(&cache_lock);
     UseEnt *e = *use_slot(h);
     int seen = e != NULL, known = e && e->known;
     if (known) *m = e->m;
-    ReleaseSRWLockShared(&cache_lock);
+    plat_mutex_unlock_shared(&cache_lock);
     if (seen) return known;
     uint8_t name[32];
     use_name(h, name);
-    if (InterlockedCompareExchange(&use_files_ready, 0, 0)) {   // complete: a name not in it has no file
+    if (__sync_val_compare_and_swap(&use_files_ready, 0, 0)) {   // complete: a name not in it has no file
         UseFile *u = *use_file_slot(name);
         if ((known = u != NULL)) *m = u->m;
     } else {
@@ -829,9 +826,9 @@ static int use_find(const uint8_t h[32], UseMask *m) {
         if (known) m->slots = f[2], m->attrs = f[3], m->fouts = f[4];
         free(f);
     }
-    AcquireSRWLockExclusive(&cache_lock);
+    plat_mutex_lock(&cache_lock);
     use_put(h, known, m);
-    ReleaseSRWLockExclusive(&cache_lock);
+    plat_mutex_unlock(&cache_lock);
     return known;
 }
 
@@ -840,9 +837,9 @@ static void use_store(const uint8_t h[32], const UseMask *m) {
     use_path(h, p);
     uint32_t f[5] = {USE_MAGIC, USE_VERSION, m->slots, m->attrs, m->fouts};
     plat_file_write_atomic(p, f, sizeof f);
-    AcquireSRWLockExclusive(&cache_lock);
+    plat_mutex_lock(&cache_lock);
     use_put(h, 1, m);
-    ReleaseSRWLockExclusive(&cache_lock);
+    plat_mutex_unlock(&cache_lock);
 }
 
 static void put_u32(uint8_t **p, uint32_t v) { memcpy(*p, &v, 4), *p += 4; }
@@ -997,7 +994,7 @@ uint64_t gfx_shader_cache_hits(void) { return (uint64_t)n_hits; }     // gets an
 
 // Drops the memory cache (the probe uses it to prove the disk cache). Pointers handed out before are invalid.
 void gfx_shader_drop_memory(void) {
-    AcquireSRWLockExclusive(&cache_lock);
+    plat_mutex_lock(&cache_lock);
     for (int i = 0; i < BUCKETS; i++) {
         for (GfxShader *s = buckets[i], *n; s; s = n) {
             n = s->next;
@@ -1009,16 +1006,16 @@ void gfx_shader_drop_memory(void) {
         use_buckets[i] = NULL;
     }
     // the preloaded .use table misses the masks this run wrote, which only use_buckets held: back to the disk
-    InterlockedExchange(&use_files_ready, 0);
+    __atomic_exchange_n(&use_files_ready, 0, __ATOMIC_SEQ_CST);
     for (int i = 0; i < USE_FILE_BUCKETS; i++) {
         for (UseFile *e = use_files[i], *n; e; e = n) n = e->next, free(e);
         use_files[i] = NULL;
     }
-    ReleaseSRWLockExclusive(&cache_lock);
+    plat_mutex_unlock(&cache_lock);
 }
 
 static const GfxShader *fail(const char *why, const char *hex) {
-    InterlockedIncrement64(&n_failures);
+    __atomic_add_fetch(&n_failures, 1, __ATOMIC_SEQ_CST);
     rt_log("gfx_shader: translation failed (%s): %s", hex ? hex : "-", why);
     return NULL;
 }
@@ -1064,10 +1061,10 @@ static const GfxShader *get_async_one(Req r, int stage, const uint8_t *control, 
 static const GfxShader *get_one(const Req *r, int stage, const uint8_t *control, const uint8_t *code,
                                 const GfxShaderAnswers *a) {
     GfxShader *s = mem_find(r->key);
-    if (s) return InterlockedIncrement64(&n_hits), s;
+    if (s) return __atomic_add_fetch(&n_hits, 1, __ATOMIC_SEQ_CST), s;
     paths();
     if (!cache_dir[0]) return fail("no cache directory", NULL);
-    if (r->final && (s = disk_load(r->key, r->iid))) return InterlockedIncrement64(&n_hits), mem_insert(s);
+    if (r->final && (s = disk_load(r->key, r->iid))) return __atomic_add_fetch(&n_hits, 1, __ATOMIC_SEQ_CST), mem_insert(s);
     return translate(r, stage, control, code, a);
 }
 
@@ -1097,7 +1094,7 @@ typedef struct {
 static void in_path(const uint8_t iid[32], char *p) {
     char hex[65];
     key_hex(iid, hex);
-    snprintf(p, PATH_CAP + 80, "%s\\in\\%s.in", cache_dir, hex);
+    snprintf(p, PATH_CAP + 80, "%s" PLAT_SEP "in" PLAT_SEP "%s.in", cache_dir, hex);
 }
 
 // Stores the inputs of a translation unless they are stored already; the file appears whole (written, then renamed).
@@ -1116,7 +1113,7 @@ static void in_store(const uint8_t iid[32], int stage, const uint8_t *control, c
     memcpy(o, control, CONTROL_SIZE), o += CONTROL_SIZE;
     memcpy(o, code, r->length), o += r->length;
     if (r->c1_len) memcpy(o, r->c1, r->c1_len);
-    snprintf(tmp, PATH_CAP + 120, "%s\\in", cache_dir);
+    snprintf(tmp, PATH_CAP + 120, "%s" PLAT_SEP "in", cache_dir);
     mkdir_p(tmp);
     plat_file_write_atomic(p, buf, n);
     free(buf);
@@ -1154,16 +1151,16 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
     // Another thread may have translated it while this one waited in flight_enter.
     const uint8_t *look = r->final ? key : NULL, *look_iid = r->iid;
     if (!r->final && use_find(r->code_hash, &m)) build_key(r->code_hash, a, &m, mk, miid), look = mk, look_iid = miid;
-    if (look && (s = mem_find(look))) return InterlockedIncrement64(&n_hits), s;
-    if (look && (s = disk_load(look, look_iid))) return InterlockedIncrement64(&n_hits), mem_insert(s);
+    if (look && (s = mem_find(look))) return __atomic_add_fetch(&n_hits, 1, __ATOMIC_SEQ_CST), s;
+    if (look && (s = disk_load(look, look_iid))) return __atomic_add_fetch(&n_hits, 1, __ATOMIC_SEQ_CST), mem_insert(s);
 
     uint64_t skip = stage == GFX_STAGE_CS ? 0 : CODE_SKIP;
     char hex[65], code_path[PATH_CAP + 80], spv_path[PATH_CAP + 80], res_path[PATH_CAP + 80];
     key_hex(key, hex);
     mkdir_p(cache_dir);
-    snprintf(code_path, PATH_CAP + 80, "%s\\%s.code", cache_dir, hex);
-    snprintf(spv_path, PATH_CAP + 80, "%s\\%s.spv", cache_dir, hex);
-    snprintf(res_path, PATH_CAP + 80, "%s\\%s.res.json", cache_dir, hex);
+    snprintf(code_path, PATH_CAP + 80, "%s" PLAT_SEP "%s.code", cache_dir, hex);
+    snprintf(spv_path, PATH_CAP + 80, "%s" PLAT_SEP "%s.spv", cache_dir, hex);
+    snprintf(res_path, PATH_CAP + 80, "%s" PLAT_SEP "%s.res.json", cache_dir, hex);
     if (!write_file(code_path, code + skip, (size_t)(r->length - skip))) return fail("cannot write the code file", hex);
     size_t cap = 2 * PATH_CAP * 6 + 2 * r->c1_len + 8192;
     char *req = malloc(cap), reply[LINE_MAX_LEN];
@@ -1184,22 +1181,22 @@ static const GfxShader *translate_one(const Req *r, int stage, const uint8_t *co
         build_key(r->code_hash, a, &m, mk, miid);
         char mhex[65], to[PATH_CAP + 80];
         key_hex(mk, mhex);
-        snprintf(to, PATH_CAP + 80, "%s\\%s.spv", cache_dir, mhex);
+        snprintf(to, PATH_CAP + 80, "%s" PLAT_SEP "%s.spv", cache_dir, mhex);
         int moved = plat_file_replace(spv_path, to);
-        snprintf(to, PATH_CAP + 80, "%s\\%s.res.json", cache_dir, mhex);
+        snprintf(to, PATH_CAP + 80, "%s" PLAT_SEP "%s.res.json", cache_dir, mhex);
         moved = moved && plat_file_replace(res_path, to);
         if (moved) {
             use_store(r->code_hash, &m);
         } else {                                           // keep the mask for this run only
             plat_file_delete(spv_path), plat_file_delete(res_path), rt_log("gfx_shader: cannot rename %s", hex);
-            AcquireSRWLockExclusive(&cache_lock);
+            plat_mutex_lock(&cache_lock);
             use_put(r->code_hash, 1, &m);
-            ReleaseSRWLockExclusive(&cache_lock);
+            plat_mutex_unlock(&cache_lock);
         }
         memcpy(s->key, mk, 32), memcpy(s->iid, miid, 32);
     }
     in_store(s->iid, stage, control, code, r, a);
-    InterlockedIncrement64(&n_xlated);
+    __atomic_add_fetch(&n_xlated, 1, __ATOMIC_SEQ_CST);
     return mem_insert(s);
 }
 
@@ -1235,14 +1232,14 @@ typedef struct XWait {
 } XWait;
 
 static struct {
-    SRWLOCK lock;
-    CONDITION_VARIABLE work, done;                         // done: a job finished (gfx_shader_await)
+    PlatMutex lock;
+    PlatCond work, done;                         // done: a job finished (gfx_shader_await)
     XJob *head, *tail;
     XWait *waits[256];
     int started;                                           // 1 running, -1 no thread could be created
-} X = {SRWLOCK_INIT, CONDITION_VARIABLE_INIT, CONDITION_VARIABLE_INIT};
+} X = {PLAT_MUTEX_INIT, PLAT_COND_INIT, PLAT_COND_INIT};
 
-static volatile LONG64 n_async;
+static volatile int64_t n_async;
 
 // Caller holds X.lock.
 static XWait **wait_slot(const uint8_t key[32]) {
@@ -1251,25 +1248,24 @@ static XWait **wait_slot(const uint8_t key[32]) {
     return w;
 }
 
-static DWORD WINAPI xlate_worker(void *arg) {
+static void xlate_worker(void *arg) {
     (void)arg;
     for (;;) {
-        AcquireSRWLockExclusive(&X.lock);
-        while (!X.head) SleepConditionVariableSRW(&X.work, &X.lock, INFINITE, 0);
+        plat_mutex_lock(&X.lock);
+        while (!X.head) plat_cond_wait(&X.work, &X.lock);
         XJob *j = X.head;
         if (!(X.head = j->next)) X.tail = NULL;
-        ReleaseSRWLockExclusive(&X.lock);
+        plat_mutex_unlock(&X.lock);
         const GfxShader *s = translate(&j->r, j->stage, j->control, j->code, &j->a);
-        AcquireSRWLockExclusive(&X.lock);
+        plat_mutex_lock(&X.lock);
         XWait **w = wait_slot(j->r.key), *e = *w;
         if (e && s) *w = e->next, free(e);
         else if (e) e->failed = 1;
-        ReleaseSRWLockExclusive(&X.lock);
-        WakeAllConditionVariable(&X.done);
-        if (s) InterlockedIncrement64(&n_async);
+        plat_mutex_unlock(&X.lock);
+        plat_cond_broadcast(&X.done);
+        if (s) __atomic_add_fetch(&n_async, 1, __ATOMIC_SEQ_CST);
         free(j->control), free(j->code), free(j);
     }
-    return 0;
 }
 const GfxShader *gfx_shader_get_async(int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size,
                                       const GfxShaderAnswers *a, int *pending) {
@@ -1284,25 +1280,25 @@ const GfxShader *gfx_shader_get_async(int stage, const uint8_t *control, const u
 static const GfxShader *get_async_one(Req r, int stage, const uint8_t *control, const uint8_t *code,
                                       const GfxShaderAnswers *a, int *pending) {
     GfxShader *s = mem_find(r.key);
-    if (s) return InterlockedIncrement64(&n_hits), s;
-    AcquireSRWLockShared(&X.lock);
+    if (s) return __atomic_add_fetch(&n_hits, 1, __ATOMIC_SEQ_CST), s;
+    plat_mutex_lock_shared(&X.lock);
     XWait *w = *wait_slot(r.key);
     int failed = w && w->failed;
-    ReleaseSRWLockShared(&X.lock);
+    plat_mutex_unlock_shared(&X.lock);
     if (w) return *pending = !failed, NULL;
     paths();
     if (!cache_dir[0]) return fail("no cache directory", NULL);
-    if (r.final && (s = disk_load(r.key, r.iid))) return InterlockedIncrement64(&n_hits), mem_insert(s);
+    if (r.final && (s = disk_load(r.key, r.iid))) return __atomic_add_fetch(&n_hits, 1, __ATOMIC_SEQ_CST), mem_insert(s);
 
     XJob *j = calloc(1, sizeof *j);
     XWait *e = calloc(1, sizeof *e);
     uint8_t *ctl = malloc(CONTROL_SIZE), *cd = malloc(r.length);
-    AcquireSRWLockExclusive(&X.lock);
+    plat_mutex_lock(&X.lock);
     if (!X.started) {
         int n = 0;
         for (int i = 0; i < svc_runtime_limit(); i++) {
-            HANDLE t = CreateThread(NULL, 0, xlate_worker, NULL, 0, NULL);
-            if (t) CloseHandle(t), n++;
+            PlatThread *t = plat_thread_new(xlate_worker, NULL, NULL);
+            if (t) plat_thread_detach(t), n++;
         }
         X.started = n ? 1 : -1;
         if (n) rt_log("gfx_shader: graphics shaders are translated by %d background workers (TOTK_XLATE_PROCS)", n);
@@ -1320,9 +1316,9 @@ static const GfxShader *get_async_one(Req r, int stage, const uint8_t *control, 
         if (X.tail) X.tail->next = j;
         else X.head = j;
         X.tail = j;
-        WakeConditionVariable(&X.work);
+        plat_cond_signal(&X.work);
     }
-    ReleaseSRWLockExclusive(&X.lock);
+    plat_mutex_unlock(&X.lock);
     if (queued) return *pending = 1, NULL;
     free(j), free(e), free(ctl), free(cd);
     if (raced) return *pending = 1, NULL;
@@ -1336,7 +1332,7 @@ const GfxShader *gfx_shader_await(int stage, const uint8_t *control, const uint8
     Req r;
     if (!pending || !req_init(&r, stage, control, code, code_size, NULL, a)) return s;
     uint64_t p0 = perf_begin();   // the wait counts as the render thread's translation time
-    AcquireSRWLockExclusive(&X.lock);
+    plat_mutex_lock(&X.lock);
     for (XJob *j = X.head, *prev = NULL; j; prev = j, j = j->next)
         if (!memcmp(j->r.key, r.key, 32)) {                // queued: to the front, the worker takes it next
             if (prev) {
@@ -1347,8 +1343,8 @@ const GfxShader *gfx_shader_await(int stage, const uint8_t *control, const uint8
             break;
         }
     XWait *w;
-    while ((w = *wait_slot(r.key)) && !w->failed) SleepConditionVariableSRW(&X.done, &X.lock, INFINITE, 0);
-    ReleaseSRWLockExclusive(&X.lock);
+    while ((w = *wait_slot(r.key)) && !w->failed) plat_cond_wait(&X.done, &X.lock);
+    plat_mutex_unlock(&X.lock);
     perf_end(PERF_XLATE, p0);
     if (w) return NULL;                                    // failed: logged by the worker
     s = gfx_shader_get_async(stage, control, code, code_size, a, &pending);
@@ -1407,28 +1403,28 @@ typedef struct {
     const GfxShader **out;
     uint8_t (*other)[32];                                  // other stored inputs: translated when not cached, not loaded
     size_t n_other;
-    volatile LONG64 next, done;
-    volatile LONG missing, other_cached;
+    volatile int64_t next, done;
+    volatile int32_t missing, other_cached;
 } Warm;
 
-static DWORD WINAPI warm_worker(void *arg) {
+static void warm_worker(void *arg) {
     Warm *w = arg;
     for (;;) {
-        size_t i = (size_t)InterlockedIncrement64(&w->next) - 1;
-        if (i >= w->n_named + w->n_other) return 0;
+        size_t i = (size_t)__atomic_add_fetch(&w->next, 1, __ATOMIC_SEQ_CST) - 1;
+        if (i >= w->n_named + w->n_other) return;
         if (i < w->n_named) {
-            if (!(w->out[i] = gfx_shader_load_input(w->named[i], 1))) InterlockedIncrement(&w->missing);
+            if (!(w->out[i] = gfx_shader_load_input(w->named[i], 1))) __atomic_add_fetch(&w->missing, 1, __ATOMIC_SEQ_CST);
         } else {
             const uint8_t *iid = w->other[i - w->n_named];
             uint8_t key[32];
             char hex[65], p[PATH_CAP + 80];
             key_of_input(iid, key);
             key_hex(key, hex);
-            snprintf(p, PATH_CAP + 80, "%s\\%s.spv", cache_dir, hex);
-            if (file_exists(p)) InterlockedIncrement(&w->other_cached);
+            snprintf(p, PATH_CAP + 80, "%s" PLAT_SEP "%s.spv", cache_dir, hex);
+            if (file_exists(p)) __atomic_add_fetch(&w->other_cached, 1, __ATOMIC_SEQ_CST);
             else gfx_shader_load_input(iid, 1);
         }
-        InterlockedIncrement64(&w->done);
+        __atomic_add_fetch(&w->done, 1, __ATOMIC_SEQ_CST);
     }
 }
 
@@ -1461,7 +1457,7 @@ static int in_collect(const char *file, void *ctx) {
 // The stored inputs not in named (sorted): ids parsed from the in/ file names.
 static size_t other_inputs(const uint8_t (*named)[32], size_t n_named, uint8_t (**out)[32]) {
     char dir[PATH_CAP + 80];
-    snprintf(dir, sizeof dir, "%s\\in", cache_dir);
+    snprintf(dir, sizeof dir, "%s" PLAT_SEP "in", cache_dir);
     InList l = {.named = named, .n_named = n_named};
     plat_file_list(dir, ".in", in_collect, &l);
     return *out = l.v, l.n;
@@ -1469,7 +1465,7 @@ static size_t other_inputs(const uint8_t (*named)[32], size_t n_named, uint8_t (
 
 void gfx_shader_prewarm(const uint8_t (*iids)[32], size_t n, const GfxShader **out, int threads, int procs) {
     paths();
-    double t0 = (double)GetTickCount64();
+    double t0 = (double)plat_tick_ms();
     memset(out, 0, n * sizeof *out);
     if (!cache_dir[0]) return;
     uint64_t xl0 = (uint64_t)n_xlated, fail0 = (uint64_t)n_failures;
@@ -1482,23 +1478,22 @@ void gfx_shader_prewarm(const uint8_t (*iids)[32], size_t n, const GfxShader **o
     threads = threads < 1 ? 1 : threads > 64 ? 64 : threads;
     if ((size_t)threads > total) threads = (int)(total ? total : 1);
     svc_set_limit(procs);
-    HANDLE t[64];
+    PlatThread *t[64];
     int k = 0;
     for (int i = 0; i < threads; i++)
-        if ((t[k] = CreateThread(NULL, 0, warm_worker, &w, 0, NULL))) k++;
+        if ((t[k] = plat_thread_new(warm_worker, &w, NULL))) k++;
     if (!k) warm_worker(&w);
-    for (int m = 0; k && m < k; m += MAXIMUM_WAIT_OBJECTS) {
-        int c = k - m < MAXIMUM_WAIT_OBJECTS ? k - m : MAXIMUM_WAIT_OBJECTS;
-        while (WaitForMultipleObjects((DWORD)c, t + m, TRUE, 2000) == WAIT_TIMEOUT)
+    for (int m = 0; m < k; m++) {
+        while (!plat_thread_wait_ms(t[m], 2000))
             rt_log("gfx_shader: prewarm: %lld of %zu shaders, %llu translated, %.0f ms", (long long)w.done, total,
-                   (unsigned long long)((uint64_t)n_xlated - xl0), (double)GetTickCount64() - t0);
+                   (unsigned long long)((uint64_t)n_xlated - xl0), (double)plat_tick_ms() - t0);
+        plat_thread_join(t[m]);
     }
-    for (int i = 0; i < k; i++) CloseHandle(t[i]);
     svc_set_limit(svc_runtime_limit());
     rt_log("gfx_shader: prewarm: %zu shaders named by pipeline keys (%ld not available), %zu other stored inputs (%ld "
            "cached); %llu translated, %llu failed, with up to %d translators and %d threads, in %.0f ms", w.n_named,
            (long)w.missing, w.n_other, (long)w.other_cached, (unsigned long long)((uint64_t)n_xlated - xl0),
-           (unsigned long long)((uint64_t)n_failures - fail0), procs, k, (double)GetTickCount64() - t0);
+           (unsigned long long)((uint64_t)n_failures - fail0), procs, k, (double)plat_tick_ms() - t0);
     free(w.other);
 }
 const uint32_t *gfx_shader_spirv(const GfxShader *s, uint64_t *words) {
@@ -1555,13 +1550,13 @@ typedef struct { uint64_t *v; uint32_t cap, n; } Set64;    // open addressing, 0
 typedef struct { uint8_t *p; size_t n, cap; } Bytes;
 
 static struct {
-    SRWLOCK lock;
-    volatile LONG on;
+    PlatMutex lock;
+    volatile int32_t on;
     char ans_path[PATH_CAP], prg_path[PATH_CAP];
     Set64 pairs, progs;                                    // input ids, code hashes seen (in the files or this run)
     Bytes ans, prg;                                        // pending
     uint64_t pairs_new;                                    // added this run
-} RC = {SRWLOCK_INIT};
+} RC = {PLAT_MUTEX_INIT};
 
 static int set_add(Set64 *s, uint64_t h) {                 // 1 if new
     h = h ? h : 1;
@@ -1661,7 +1656,7 @@ static void truncate_to(const char *path, size_t size) {
 
 void gfx_shader_record_at(const char *keys_path) {
     if (!keys_path || !keys_path[0] || RC.on) return;
-    AcquireSRWLockExclusive(&RC.lock);
+    plat_mutex_lock(&RC.lock);
     const char *slash = strrchr(keys_path, '\\'), *fs = strrchr(keys_path, '/');
     if (fs > slash) slash = fs;
     int dir = slash ? (int)(slash + 1 - keys_path) : 0;
@@ -1681,8 +1676,8 @@ void gfx_shader_record_at(const char *keys_path) {
     free(b);
     rt_log("gfx_shader: recording answers met in play to %s (%u records, %u programs recorded before)", RC.ans_path,
            RC.pairs.n, RC.progs.n);
-    InterlockedExchange(&RC.on, 1);
-    ReleaseSRWLockExclusive(&RC.lock);
+    __atomic_exchange_n(&RC.on, 1, __ATOMIC_SEQ_CST);
+    plat_mutex_unlock(&RC.lock);
 }
 
 // A get resolved (r, a) to s: queue the record when its input id is new, and its program when new. Cost: a set
@@ -1691,7 +1686,7 @@ static void ans_note(const Req *r, int stage, const uint8_t *control, const uint
                      const GfxShader *s) {
     if (!RC.on) return;
     uint32_t st = (uint32_t)stage;
-    AcquireSRWLockExclusive(&RC.lock);
+    plat_mutex_lock(&RC.lock);
     if (set_add(&RC.pairs, hash8(s->iid))) {
         uint8_t rec[ANS_REC] = {0};
         memcpy(rec, &st, 4), memcpy(rec + 4, r->code_hash, 32), memcpy(rec + 36, s->iid, 32);
@@ -1705,7 +1700,7 @@ static void ans_note(const Req *r, int stage, const uint8_t *control, const uint
         bytes_put(&RC.ans, rec, sizeof rec);
         RC.pairs_new++;
     }
-    ReleaseSRWLockExclusive(&RC.lock);
+    plat_mutex_unlock(&RC.lock);
 }
 
 static int rec_append(const char *path, const char *magic, uint32_t version, uint32_t rec_size, const Bytes *b) {
@@ -1722,23 +1717,23 @@ static int rec_append(const char *path, const char *magic, uint32_t version, uin
     return !fclose(f) && ok;
 }
 
-static SRWLOCK rec_io = SRWLOCK_INIT;   // the record files: appends in order, no read during an append
+static PlatMutex rec_io = PLAT_MUTEX_INIT;   // the record files: appends in order, no read during an append
 
 void gfx_shader_record_flush(int force) {
-    static volatile LONG64 last;
-    LONG64 now = (LONG64)GetTickCount64();
+    static volatile int64_t last;
+    int64_t now = (int64_t)plat_tick_ms();
     if (!RC.on || (!force && now - last < 2000)) return;
     last = now;
     // The files are written outside RC.lock, which the render thread takes to record a new answer.
-    AcquireSRWLockExclusive(&rec_io);
-    AcquireSRWLockExclusive(&RC.lock);
+    plat_mutex_lock(&rec_io);
+    plat_mutex_lock(&RC.lock);
     Bytes ans = RC.ans, prg = RC.prg;
     RC.ans = (Bytes){0}, RC.prg = (Bytes){0};
     uint64_t total = RC.pairs.n, added = RC.pairs_new;
-    ReleaseSRWLockExclusive(&RC.lock);
+    plat_mutex_unlock(&RC.lock);
     if (prg.n && !rec_append(RC.prg_path, "TOTKSPRG", PRG_VERSION, 0, &prg)) rt_log("gfx_shader: cannot write %s", RC.prg_path);
     if (ans.n && !rec_append(RC.ans_path, "TOTKSANS", ANS_VERSION, ANS_REC, &ans)) rt_log("gfx_shader: cannot write %s", RC.ans_path);
-    ReleaseSRWLockExclusive(&rec_io);
+    plat_mutex_unlock(&rec_io);
     if (ans.n) rt_log("gfx_shader: answers: %zu new records appended (%llu new this run, %llu recorded)", ans.n / ANS_REC,
                       (unsigned long long)added, (unsigned long long)total);
     free(ans.p), free(prg.p);
@@ -1755,7 +1750,7 @@ typedef struct {
     const uint8_t *ans;
     size_t n_ans;
     uint8_t (*iid)[32];                                    // per answers record: the resolved input id, zero on failure
-    volatile LONG64 next, done, missing, failed;
+    volatile int64_t next, done, missing, failed;
 } Prep;
 
 static int prg_cmp(const void *x, const void *y) { return memcmp(((const PrgIdx *)x)->rec + 12, ((const PrgIdx *)y)->rec + 12, 32); }
@@ -1765,17 +1760,17 @@ static void prg_collect(const uint8_t *rec, void *ctx) {
     l->idx[l->n++].rec = rec;
 }
 
-static DWORD WINAPI prep_worker(void *arg) {
+static void prep_worker(void *arg) {
     Prep *p = arg;
     for (;;) {
-        size_t i = (size_t)InterlockedIncrement64(&p->next) - 1;
-        if (i >= p->n_ans) return 0;
+        size_t i = (size_t)__atomic_add_fetch(&p->next, 1, __ATOMIC_SEQ_CST) - 1;
+        if (i >= p->n_ans) return;
         const uint8_t *r = p->ans + i * ANS_REC;
         uint8_t key_rec[12 + 32];
         memcpy(key_rec + 12, r + 4, 32);
         PrgIdx k = {key_rec}, *e = bsearch(&k, p->progs.idx, p->progs.n, sizeof k, prg_cmp);
         if (!e) {
-            InterlockedIncrement64(&p->missing), InterlockedIncrement64(&p->done);
+            __atomic_add_fetch(&p->missing, 1, __ATOMIC_SEQ_CST), __atomic_add_fetch(&p->done, 1, __ATOMIC_SEQ_CST);
             continue;
         }
         uint32_t st, len;
@@ -1784,9 +1779,9 @@ static DWORD WINAPI prep_worker(void *arg) {
         GfxShaderAnswers a;
         unpack_answers(r + 68, &a);
         const GfxShader *s = gfx_shader_get((int)st, control, code, len, c1, &a);
-        if (!s) InterlockedIncrement64(&p->failed);
+        if (!s) __atomic_add_fetch(&p->failed, 1, __ATOMIC_SEQ_CST);
         else if (p->iid) memcpy(p->iid[i], s->iid, 32);
-        InterlockedIncrement64(&p->done);
+        __atomic_add_fetch(&p->done, 1, __ATOMIC_SEQ_CST);
     }
 }
 
@@ -1796,7 +1791,7 @@ static DWORD WINAPI prep_worker(void *arg) {
 static long long prepare_files(const char *ans_path, const char *prg_path, int threads, int procs, const char *what,
                                uint8_t **ans_out, uint8_t (**iid_out)[32]) {
     paths();
-    double t0 = (double)GetTickCount64();
+    double t0 = (double)plat_tick_ms();
     uint8_t *ab = NULL, *pb = NULL;
     size_t an = 0, pn = 0;
     if (!rec_read(ans_path, "TOTKSANS", ANS_VERSION, ANS_REC, &ab, &an) ||
@@ -1813,22 +1808,21 @@ static long long prepare_files(const char *ans_path, const char *prg_path, int t
     uint64_t xl0 = (uint64_t)n_xlated;
     threads = threads < 1 ? 1 : threads > 64 ? 64 : threads;
     svc_set_limit(procs);
-    HANDLE t[64];
+    PlatThread *t[64];
     int k = 0;
     for (int i = 0; i < threads; i++)
-        if ((t[k] = CreateThread(NULL, 0, prep_worker, &p, 0, NULL))) k++;
+        if ((t[k] = plat_thread_new(prep_worker, &p, NULL))) k++;
     if (!k) prep_worker(&p);
-    for (int m = 0; k && m < k; m += MAXIMUM_WAIT_OBJECTS) {
-        int c = k - m < MAXIMUM_WAIT_OBJECTS ? k - m : MAXIMUM_WAIT_OBJECTS;
-        while (WaitForMultipleObjects((DWORD)c, t + m, TRUE, 5000) == WAIT_TIMEOUT)
+    for (int m = 0; m < k; m++) {
+        while (!plat_thread_wait_ms(t[m], 5000))
             rt_log("gfx_shader: prepare: %lld of %zu pairs, %llu translated, %.0f ms", (long long)p.done, p.n_ans,
-                   (unsigned long long)((uint64_t)n_xlated - xl0), (double)GetTickCount64() - t0);
+                   (unsigned long long)((uint64_t)n_xlated - xl0), (double)plat_tick_ms() - t0);
+        plat_thread_join(t[m]);
     }
-    for (int i = 0; i < k; i++) CloseHandle(t[i]);
     svc_set_limit(svc_runtime_limit());
     rt_log("gfx_shader: prepare: %zu %s of %zu programs: %llu translated, %lld failed, %lld without a program, the rest "
            "cached; %.0f ms", p.n_ans, what, p.progs.n, (unsigned long long)((uint64_t)n_xlated - xl0), (long long)p.failed,
-           (long long)p.missing, (double)GetTickCount64() - t0);
+           (long long)p.missing, (double)plat_tick_ms() - t0);
     free(p.progs.idx), free(pb);
     if (ans_out) *ans_out = ab;
     else free(ab);
@@ -1852,10 +1846,10 @@ void gfx_shader_prepare_recorded(int threads, int procs) {
 
 int gfx_shader_prepare_seed(const char *dir, int threads, int procs) {
     char ans[PATH_CAP + 32], prg[PATH_CAP + 32], out[PATH_CAP + 32];
-    snprintf(ans, sizeof ans, "%s\\seed-answers.bin", dir);
-    snprintf(prg, sizeof prg, "%s\\seed-programs.bin", dir);
-    snprintf(out, sizeof out, "%s\\shader-prepared.bin", dir);
-    double t0 = (double)GetTickCount64();
+    snprintf(ans, sizeof ans, "%s" PLAT_SEP "seed-answers.bin", dir);
+    snprintf(prg, sizeof prg, "%s" PLAT_SEP "seed-programs.bin", dir);
+    snprintf(out, sizeof out, "%s" PLAT_SEP "shader-prepared.bin", dir);
+    double t0 = (double)plat_tick_ms();
     uint64_t fail0 = (uint64_t)n_failures;
     uint8_t *ab = NULL, (*iid)[32] = NULL;
     long long n = prepare_files(ans, prg, threads, procs, "seed variants", &ab, &iid);
@@ -1884,7 +1878,7 @@ int gfx_shader_prepare_seed(const char *dir, int threads, int procs) {
     snprintf(msg, sizeof msg, "gfx_shader: prepared %zu shader variants (vertex %zu, fragment %zu, compute %zu; title %zu, "
              "warm-up %zu, other %zu) from %lld seed records, %llu translations failed, in %.0f ms; %s %s", u,
              stages[GFX_STAGE_VS], stages[GFX_STAGE_FS], stages[GFX_STAGE_CS], by[0], by[1], by[2], n,
-             (unsigned long long)((uint64_t)n_failures - fail0), (double)GetTickCount64() - t0,
+             (unsigned long long)((uint64_t)n_failures - fail0), (double)plat_tick_ms() - t0,
              ok ? "wrote" : "cannot write", out);
     rt_log("%s", msg);
     printf("%s\n", msg);
@@ -1902,9 +1896,9 @@ size_t gfx_shader_warm_list(GfxWarmEnt **out) {
              RC.ans_path);
     uint8_t *ab = NULL, *pb = NULL;
     size_t an = 0, pn = 0;
-    AcquireSRWLockExclusive(&rec_io);                      // no append meanwhile
+    plat_mutex_lock(&rec_io);                      // no append meanwhile
     rec_read(RC.ans_path, "TOTKSANS", ANS_VERSION, ANS_REC, &ab, &an);
-    ReleaseSRWLockExclusive(&rec_io);
+    plat_mutex_unlock(&rec_io);
     rec_read(prp, "TOTKSPRP", PRP_VERSION, PRP_REC, &pb, &pn);
     size_t na = an / ANS_REC, np = pn / PRP_REC, n = 0;
     GfxWarmEnt *e = calloc(na + np + 1, sizeof *e);

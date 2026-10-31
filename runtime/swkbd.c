@@ -1,6 +1,6 @@
 // Adapted from MacNativeGames games/totk/runtime/swkbd_host.c @ b75be8cf (MIT, Copyright (c) 2026 MacNativeGames
 // contributors): the ShowKeyboardArg offsets, the UTF-8/UTF-16 conversions, the disabled-key filter and the result codes.
-// The macOS text bar is replaced by a Win32 window.
+// The macOS text bar is replaced by a Win32 window; on Linux, until its window exists, by accepting the starting text.
 //
 // nn::swkbd::ShowKeyboard: text entry for the game. On the Switch the call starts the keyboard library applet, which
 // takes the screen until the player confirms or cancels. TotK calls it in one place, naming a horse at a stable
@@ -18,7 +18,9 @@
 //   TOTK_SWKBD_ANSWER=<text>|<cancel>|<initial>   answer without a window (probes, scripted runs); <initial> keeps the
 //                                                 starting text (the game's, else the default name)
 //   TOTK_SWKBD_TEST=ok|cancel                     open the window, then press OK / Cancel on the first timer tick
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,6 +29,7 @@
 #include "cfg.h"
 #include "host.h"
 #include "input.h"
+#include "platform/platform.h"
 #include "ui_text.h"
 #include "vk.h"
 
@@ -133,6 +136,7 @@ typedef struct {
     uint32_t disabled;
 } SwkbdRequest;
 
+#ifdef _WIN32
 // ---- Win32 front end
 #define TIMER_ID 1
 #define TIMER_MS 16
@@ -294,6 +298,15 @@ static int text_entry_run(const SwkbdRequest *req, uint16_t *out, size_t cap, si
     return 1;
 }
 
+#else
+// No window to ask in yet: the starting text stands as the player's answer, so a horse gets its default name.
+static int text_entry_run(const SwkbdRequest *req, uint16_t *out, size_t cap, size_t *n) {
+    *n = u16_len(req->initial, cap);
+    memcpy(out, req->initial, *n * 2);
+    return 1;
+}
+#endif
+
 // ---- nn::swkbd::ShowKeyboard
 static void request_from(const uint8_t *arg, SwkbdRequest *r) {
     memset(r, 0, sizeof *r);
@@ -331,14 +344,14 @@ static void ov_show_keyboard(Cpu *c) {
     char lr[96];
     if (!str || !arg) rt_fatal("nn::swkbd::ShowKeyboard from %s: null argument", ldr_describe(c->x[30] - 4, lr, sizeof lr));
     static SwkbdRequest req;   // one keyboard at a time (the applet is modal too)
-    static SRWLOCK one = SRWLOCK_INIT;
+    static PlatMutex one = PLAT_MUTEX_INIT;
     int utf8 = arg[KB_UTF8] != 0;
     uint16_t u[KB_LIMIT * 2 + 1];
     size_t n = 0;
     int confirmed;
     const char *forced = cfg_get("TOTK_SWKBD_ANSWER");
     int away = kern_core_away();
-    AcquireSRWLockExclusive(&one);
+    plat_mutex_lock(&one);
     request_from(arg, &req);
     if (forced && *forced) {
         confirmed = strcmp(forced, "<cancel>") != 0;
@@ -371,7 +384,7 @@ static void ov_show_keyboard(Cpu *c) {
            ldr_describe(c->x[30] - 4, lr, sizeof lr), prompt, req.min_len, req.max_len, req.disabled,
            utf8 ? "UTF-8" : "UTF-16", req.game_initial ? "game" : "default", forced && *forced ? " [TOTK_SWKBD_ANSWER]" : "",
            confirmed ? "\"" : "cancelled", confirmed ? shown : "", confirmed ? "\"" : "");
-    ReleaseSRWLockExclusive(&one);
+    plat_mutex_unlock(&one);
     kern_core_back(&away);
     ret_x(c, confirmed ? 0 : SWKBD_CANCELED);
 }

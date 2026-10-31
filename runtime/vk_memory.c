@@ -13,8 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
-
+#include "platform/platform.h"
 #include "cfg.h"
 #include "gfx.h"
 #include "host.h"
@@ -24,17 +23,17 @@
 
 // Raw performance counter ticks for the tracking cost (no division on the replay's path); qpc_ms converts.
 static uint64_t qpc(void) {
-    LARGE_INTEGER t;
-    QueryPerformanceCounter(&t);
-    return (uint64_t)t.QuadPart;
+    int64_t t;
+    t = (int64_t)plat_counter();
+    return (uint64_t)t;
 }
 
 static double qpc_ms(uint64_t ticks) {
     static double per_ms;
     if (!per_ms) {
-        LARGE_INTEGER f;
-        QueryPerformanceFrequency(&f);
-        per_ms = (double)f.QuadPart / 1000.0;
+        int64_t f;
+        f = (int64_t)plat_counter_hz();
+        per_ms = (double)f / 1000.0;
     }
     return (double)ticks / per_ms;
 }
@@ -78,7 +77,7 @@ static void mirror_retiring(PoolRec *r);  // vk_pool_fini: kept until mirror_ret
 static void mirror_retire(void *arg);    // completion thread: destroys a finalized mirrored pool's record
 static void grow(void **arr, int *cap, size_t elem);
 
-static SRWLOCK pool_lock = SRWLOCK_INIT;
+static PlatMutex pool_lock = PLAT_MUTEX_INIT;
 // Bumped under pool_lock (exclusive) by every change to the index or a page table: vk_mem_resolve's per-thread hits
 // stay valid while it is unchanged.
 static uint64_t pool_gen = 1;
@@ -161,7 +160,7 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
         r->mem = VK_NULL_HANDLE;
         return 0;
     }
-    InterlockedIncrement(&n_imports);
+    __atomic_add_fetch(&n_imports, 1, __ATOMIC_SEQ_CST);
     return 1;
 }
 
@@ -267,7 +266,7 @@ int vk_pool_init(pool_t *p) {
         ok = import_pool(c, r, (uintptr_t)p->mem, p->size);
         if (!ok) {
             // Not fatal for the game: the pool works for the CPU, and vk_mem_resolve reports its addresses as unbacked.
-            long n = InterlockedIncrement(&n_import_failures);
+            long n = __atomic_add_fetch(&n_import_failures, 1, __ATOMIC_SEQ_CST);
             if (n <= 8) rt_log("vk: pool %p (flags %#x, %#llx bytes) has no GPU buffer (%ld so far)", (void *)p->mem,
                                p->flags, (unsigned long long)p->size, n);
             r->buf = VK_NULL_HANDLE;
@@ -275,7 +274,7 @@ int vk_pool_init(pool_t *p) {
         }
     }
     if (!ok) { free(r->pt); free(r); return 0; }
-    AcquireSRWLockExclusive(&pool_lock);
+    plat_mutex_lock(&pool_lock);
     index_put(r);
     if (r->kind == POOL_PHYS) {
         if (nphys == cap_phys) {
@@ -285,7 +284,7 @@ int vk_pool_init(pool_t *p) {
         }
         phys_list[nphys++] = r;
     }
-    ReleaseSRWLockExclusive(&pool_lock);
+    plat_mutex_unlock(&pool_lock);
     return 1;
 }
 
@@ -293,7 +292,7 @@ void vk_pool_fini(pool_t *p) {
     VkCtx *c = vk_ctx();
     if (!c) return;
     pidx_ent e;
-    AcquireSRWLockExclusive(&pool_lock);
+    plat_mutex_lock(&pool_lock);
     int had = pidx_remove(&pool_index, p, &e);
     __atomic_add_fetch(&pool_gen, 1, __ATOMIC_RELEASE);
     PoolRec *r = had ? e.buf : NULL;
@@ -308,7 +307,7 @@ void vk_pool_fini(pool_t *p) {
                 if (v->pt[k].phys == r) v->pt[k].phys = NULL;
         }
     }
-    ReleaseSRWLockExclusive(&pool_lock);
+    plat_mutex_unlock(&pool_lock);
     if (!r) return;
     if (r->kind == POOL_IMPORT) mem_thaw(r->lo, r->size);   // the storage goes back to the guest writable
     // Images cut from this range go first; a used buffer or memory waits until the GPU is done with it, since the
@@ -330,7 +329,7 @@ void vk_pool_fini(pool_t *p) {
 // Requests were checked by the front end (nvn_api_core.c, MNG totk_vpool.c); apply them in order.
 int vk_pool_map_virtual(pool_t *v, int n, const void *requests) {
     const nvn_mapping_t *rq = requests;
-    AcquireSRWLockExclusive(&pool_lock);
+    plat_mutex_lock(&pool_lock);
     const pidx_ent *e = pidx_find(&pool_index, (uintptr_t)v->mem, 0);
     PoolRec *r = e && e->key == v ? e->buf : NULL;
     int ok = r && r->kind == POOL_VIRT;
@@ -348,7 +347,7 @@ int vk_pool_map_virtual(pool_t *v, int n, const void *requests) {
         for (uint64_t k = 0; k < count; k++)
             r->pt[first + k] = (VPage){ph, ph ? (uint64_t)rq[i].physical_offset + k * NVN_VPOOL_PAGE : 0};
     }
-    ReleaseSRWLockExclusive(&pool_lock);
+    plat_mutex_unlock(&pool_lock);
     if (!ok) rt_log("vk: MapVirtual on pool %p failed", (void *)v->mem);
     return ok;
 }
@@ -406,7 +405,7 @@ int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) {
 // The pool index lookup under the lock; a non-overlapped import or physical pool goes into the address's cache slot.
 static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out) {
     memset(out, 0, sizeof *out);
-    AcquireSRWLockShared(&pool_lock);
+    plat_mutex_lock_shared(&pool_lock);
     const pidx_ent *e = pidx_find(&pool_index, (uintptr_t)addr, size);
     PoolRec *r = e ? e->buf : NULL;
     int ok = 0;
@@ -446,11 +445,11 @@ static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out) {
             out->alloc = ph->alloc;
             out->cls = VK_MCLS_DEVICE;
             ok = out->avail >= size;
-            if (ok && !ph->used) InterlockedExchange(&ph->used, 1);   // read first: the flag is only ever set
+            if (ok && !ph->used) __atomic_exchange_n(&ph->used, 1, __ATOMIC_SEQ_CST);   // read first: the flag is only ever set
         }
     }
-    if (ok && !r->used) InterlockedExchange(&r->used, 1);
-    ReleaseSRWLockShared(&pool_lock);
+    if (ok && !r->used) __atomic_exchange_n(&r->used, 1, __ATOMIC_SEQ_CST);
+    plat_mutex_unlock_shared(&pool_lock);
     if (!ok) memset(out, 0, sizeof *out);
     return ok;
 }
@@ -465,13 +464,13 @@ int vk_mem_class_of(uint64_t addr) {
 }
 
 // ---------------------------------------------------------------- census
-static volatile LONG64 traffic[VK_MCLS_N][VK_MUSE_N];
+static volatile int64_t traffic[VK_MCLS_N][VK_MUSE_N];
 
 // Every caller is the replay (vk_exec*, under vk_sync_submit's lock), about ten adds per draw: one writer at a time, so
 // a plain add, not a locked one. An add racing the census's reset may be lost.
 void vk_mem_count(int cls, int use, uint64_t bytes) {
     if ((unsigned)cls < VK_MCLS_N && (unsigned)use < VK_MUSE_N)
-        __atomic_store_n(&traffic[cls][use], __atomic_load_n(&traffic[cls][use], __ATOMIC_RELAXED) + (LONG64)bytes,
+        __atomic_store_n(&traffic[cls][use], __atomic_load_n(&traffic[cls][use], __ATOMIC_RELAXED) + (int64_t)bytes,
                          __ATOMIC_RELAXED);
 }
 
@@ -503,7 +502,7 @@ void vk_mem_census(uint64_t frame) {
                                                                                                          // write-watch line
     if (frame == 1200) {   // loading is over: the first window starts here
         for (int c = 0; c < VK_MCLS_N; c++)
-            for (int u = 0; u < VK_MUSE_N; u++) InterlockedExchange64(&traffic[c][u], 0);
+            for (int u = 0; u < VK_MUSE_N; u++) __atomic_exchange_n(&traffic[c][u], 0, __ATOMIC_SEQ_CST);
         window_start = frame;
         return;
     }
@@ -513,7 +512,7 @@ void vk_mem_census(uint64_t frame) {
     Group g[64];
     int ng = 0;
     uint64_t total[4] = {0}, count[4] = {0};
-    AcquireSRWLockShared(&pool_lock);
+    plat_mutex_lock_shared(&pool_lock);
     for (int i = 0; i < pool_index.n; i++) {
         const PoolRec *r = pool_index.e[i].buf;
         int j = 0;
@@ -522,7 +521,7 @@ void vk_mem_census(uint64_t frame) {
         if (j < ng) g[j].n++, g[j].bytes += r->size;
         total[r->kind] += r->size, count[r->kind]++;
     }
-    ReleaseSRWLockShared(&pool_lock);
+    plat_mutex_unlock_shared(&pool_lock);
     rt_log("mem: census at frame %llu: import %llu pools %.1f MiB (%ld without a GPU buffer), physical %llu pools %.1f MiB, "
            "virtual %llu pools %.1f MiB of address space",
            (unsigned long long)frame, (unsigned long long)count[POOL_IMPORT], total[POOL_IMPORT] / 1048576.0,
@@ -541,7 +540,7 @@ void vk_mem_census(uint64_t frame) {
            "storage indirect copy-src gpu-write cpu-read", (unsigned long long)frames);
     for (int c = 1; c < VK_MCLS_N; c++) {
         double v[VK_MUSE_N];
-        for (int u = 0; u < VK_MUSE_N; u++) v[u] = InterlockedExchange64(&traffic[c][u], 0) / 1048576.0 / (double)(frames ? frames : 1);
+        for (int u = 0; u < VK_MUSE_N; u++) v[u] = __atomic_exchange_n(&traffic[c][u], 0, __ATOMIC_SEQ_CST) / 1048576.0 / (double)(frames ? frames : 1);
         rt_log("mem:   %s: %.2f %.2f %.2f %.2f %.3f %.2f %.2f %.3f", cls[c], v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
     }
     window_start = frame;
@@ -579,7 +578,7 @@ int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact) {
 #define GEN_PER_CHUNK (1u << (GEN_CHUNK_SHIFT - GEN_PAGE_SHIFT))
 static uint32_t *gen_chunk[GEN_CHUNKS];
 static uint32_t gen_now;                 // last generation handed out
-static SRWLOCK gen_lock = SRWLOCK_INIT;
+static PlatMutex gen_lock = PLAT_MUTEX_INIT;
 static uint64_t gen_pages[1024];
 // The newest generation stamped on any page of each 2 MiB region (the write-watch snapshot regions below): the mirror
 // sync skips regions with nothing newer than its pool's mirror.
@@ -643,15 +642,15 @@ static void stamp_range(uint64_t lo, uint64_t hi, uint32_t g) {
 void vk_guest_written(uint64_t addr, uint64_t size) {
     if (!size || nvn_gpu_only(addr)) return;
     uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
-    AcquireSRWLockExclusive(&gen_lock);
+    plat_mutex_lock(&gen_lock);
     stamp_range(lo, hi, ++gen_now);
-    ReleaseSRWLockExclusive(&gen_lock);
+    plat_mutex_unlock(&gen_lock);
 }
 
 int vk_mem_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now) {
     if (!size) { *now = since; return 0; }
     uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
-    AcquireSRWLockExclusive(&gen_lock);
+    plat_mutex_lock(&gen_lock);
     uint32_t g = ++gen_now;
     int tracked = 1, frozen = 1;
     for (uint64_t a = lo & ~((1ull << REG_SHIFT) - 1); a < hi && frozen; a += 1ull << REG_SHIFT) frozen = mem_frozen(a);
@@ -666,7 +665,7 @@ int vk_mem_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now) 
         uint32_t *s = gen_slot(a, 0);
         if (s && *s > since) changed = 1;
     }
-    ReleaseSRWLockExclusive(&gen_lock);
+    plat_mutex_unlock(&gen_lock);
     *now = g;
     return tracked ? changed : -1;
 }
@@ -726,12 +725,12 @@ int vk_mem_changed_snap(uint64_t addr, uint64_t size, uint32_t since, uint32_t e
     uint64_t r0 = lo >> SNAP_SHIFT, r1 = (hi - 1) >> SNAP_SHIFT;
     if (!epoch || r1 >= SNAP_REGIONS) return vk_mem_changed(addr, size, since, now);
     int excl = 0;
-    AcquireSRWLockShared(&gen_lock);
+    plat_mutex_lock_shared(&gen_lock);
     for (uint64_t r = r0; r <= r1; r++)
         if (snap_at[r] != epoch) { excl = 1; break; }
     if (excl) {
-        ReleaseSRWLockShared(&gen_lock);
-        AcquireSRWLockExclusive(&gen_lock);
+        plat_mutex_unlock_shared(&gen_lock);
+        plat_mutex_lock(&gen_lock);
         n_snap_calls += snap_regions(r0, r1, epoch);
     }
     int untracked = 0, changed = 0;
@@ -749,8 +748,8 @@ int vk_mem_changed_snap(uint64_t addr, uint64_t size, uint32_t since, uint32_t e
     *now = gen_now;   // every observation so far is in the table
     __atomic_add_fetch(&n_snap_checks, 1, __ATOMIC_RELAXED);
     if (untracked) __atomic_add_fetch(&n_snap_untracked, 1, __ATOMIC_RELAXED);
-    if (excl) ReleaseSRWLockExclusive(&gen_lock);
-    else ReleaseSRWLockShared(&gen_lock);
+    if (excl) plat_mutex_unlock(&gen_lock);
+    else plat_mutex_unlock_shared(&gen_lock);
     return untracked ? -1 : changed;
 }
 
@@ -782,7 +781,7 @@ static uint32_t dirty_sub = 1, dirty_gen;   // submit lock: the current submit n
 static uint64_t first_pending[DC_N], ever_n[DC_N], ever_bytes[DC_N];   // submit lock
 static PoolRec **dlist;                     // submit lock: the buffer-bound pools of a scan
 static int dcap;
-static SRWLOCK dirty_lock = SRWLOCK_INIT;   // everything below
+static PlatMutex dirty_lock = PLAT_MUTEX_INIT;   // everything below
 static DirtyAcc dfr, dwin;                  // this frame, this window
 static uint32_t dwin_kib[DIRTY_WIN][DC_N];  // eager KiB of each frame of the window
 static uint64_t live_n[DC_N], live_bytes[DC_N], live_untracked, ever_snap_n[DC_N], ever_snap_bytes[DC_N];
@@ -821,7 +820,7 @@ void vk_mem_dirty_submit(void) {
     uint32_t prev = dirty_sub;   // the submit whose replay noted the bindings
     dirty_sub = prev + 1 ? prev + 1 : 1;
     uint64_t eager[DC_N] = {0}, lazy[DC_N] = {0}, ln[DC_N] = {0}, lb[DC_N] = {0}, untracked = 0, queries = 0;
-    AcquireSRWLockShared(&pool_lock);
+    plat_mutex_lock_shared(&pool_lock);
     if (dcap < pool_index.n) {
         dcap = pool_index.n * 2;
         dlist = realloc(dlist, (size_t)dcap * sizeof *dlist);
@@ -832,7 +831,7 @@ void vk_mem_dirty_submit(void) {
         PoolRec *r = pool_index.e[i].buf;
         if (r->kind == POOL_IMPORT && r->bufbound) dlist[n++] = r;
     }
-    AcquireSRWLockExclusive(&gen_lock);
+    plat_mutex_lock(&gen_lock);
     uint32_t g = ++gen_now, since = dirty_gen;
     dirty_gen = g;
     for (int i = 0; i < n;) {   // one query per run of pools (sorted by address)
@@ -876,11 +875,11 @@ void vk_mem_dirty_submit(void) {
         }
         eager[k] += ne << GEN_PAGE_SHIFT, lazy[k] += nl << GEN_PAGE_SHIFT;
     }
-    ReleaseSRWLockExclusive(&gen_lock);
-    ReleaseSRWLockShared(&pool_lock);
+    plat_mutex_unlock(&gen_lock);
+    plat_mutex_unlock_shared(&pool_lock);
     uint64_t tot = 0;
     for (int k = 0; k < DC_N; k++) tot += eager[k];
-    AcquireSRWLockExclusive(&dirty_lock);
+    plat_mutex_lock(&dirty_lock);
     for (int k = 0; k < DC_N; k++) {
         dfr.eager[k] += eager[k], dfr.lazy[k] += lazy[k], dfr.first[k] += first_pending[k];
         first_pending[k] = 0;
@@ -890,25 +889,25 @@ void vk_mem_dirty_submit(void) {
     dfr.submits++, dfr.queries += queries;
     if (tot > dfr.sub_max) dfr.sub_max = tot;
     dfr.scan_ns += kern_now_ns() - t0;
-    ReleaseSRWLockExclusive(&dirty_lock);
+    plat_mutex_unlock(&dirty_lock);
 }
 
 static void dirty_frame(uint64_t frame) {
-    AcquireSRWLockExclusive(&dirty_lock);
+    plat_mutex_lock(&dirty_lock);
     if (dwin.frames < DIRTY_WIN)
         for (int k = 0; k < DC_N; k++) dwin_kib[dwin.frames][k] = (uint32_t)(dfr.eager[k] >> 10);
     for (int k = 0; k < DC_N; k++) dwin.eager[k] += dfr.eager[k], dwin.lazy[k] += dfr.lazy[k], dwin.first[k] += dfr.first[k];
     dwin.submits += dfr.submits, dwin.queries += dfr.queries, dwin.scan_ns += dfr.scan_ns, dwin.frames++;
     if (dfr.sub_max > dwin.sub_max) dwin.sub_max = dfr.sub_max;
     memset(&dfr, 0, sizeof dfr);
-    if (frame % DIRTY_WIN) { ReleaseSRWLockExclusive(&dirty_lock); return; }
+    if (frame % DIRTY_WIN) { plat_mutex_unlock(&dirty_lock); return; }
     DirtyAcc w = dwin;
     uint32_t kib[DIRTY_WIN][DC_N];
     memcpy(kib, dwin_kib, sizeof kib);
     uint64_t lv[DC_N], lvb[DC_N], ev[DC_N], evb[DC_N], unt = live_untracked;
     for (int k = 0; k < DC_N; k++) lv[k] = live_n[k], lvb[k] = live_bytes[k], ev[k] = ever_snap_n[k], evb[k] = ever_snap_bytes[k];
     memset(&dwin, 0, sizeof dwin);
-    ReleaseSRWLockExclusive(&dirty_lock);
+    plat_mutex_unlock(&dirty_lock);
     if (!w.frames) return;
     uint64_t fl[2][3][2];
     nvn_flush_stats(fl);
@@ -975,7 +974,7 @@ static MRange *pend, *wbl;             // replay: copies for the next prologue; 
 static int npend, cpend, nwbl, cwbl;
 static VkBufferCopy *mregions;         // replay: vkCmdCopyBuffer regions
 static int cregions;
-static SRWLOCK flush_lock = SRWLOCK_INIT;
+static PlatMutex flush_lock = PLAT_MUTEX_INIT;
 
 typedef struct {
     uint64_t subs, syncs, upload_bytes, upload_copies, first_n, first_bytes, wb_bytes, wb_copies, wb_ranges;
@@ -983,9 +982,9 @@ typedef struct {
 } MirrorAcc;
 static MirrorAcc mrep;                 // replay: this submission
 static MirrorAcc macc;                 // mirror_stat_lock: since the last summary
-static SRWLOCK mirror_stat_lock = SRWLOCK_INIT;
-static volatile LONG64 m_live_n, m_live_bytes, m_refused_n[MR_N], m_refused_bytes[MR_N];
-static volatile LONG64 m_flush_calls, m_flush_bytes, v_pages, v_skipped, v_mismatch;
+static PlatMutex mirror_stat_lock = PLAT_MUTEX_INIT;
+static volatile int64_t m_live_n, m_live_bytes, m_refused_n[MR_N], m_refused_bytes[MR_N];
+static volatile int64_t m_flush_calls, m_flush_bytes, v_pages, v_skipped, v_mismatch;
 
 static void mirror_mode(int discrete) {
     const char *e = cfg_value("TOTK_MEMORY");
@@ -1068,13 +1067,13 @@ static void mbarrier(VkCommandBuffer cb, VkPipelineStageFlags2 ss, VkAccessFlags
 static void refuse(PoolRec *r, int why, const char *what) {
     r->mstate = MS_REFUSED;
     uint64_t n = r->import_hi - r->import_lo;
-    if (InterlockedIncrement64(&m_refused_n[why]) <= 4) {
+    if (__atomic_add_fetch(&m_refused_n[why], 1, __ATOMIC_SEQ_CST) <= 4) {
         char f[160];
         flag_names(r->flags, f, sizeof f);
         rt_log("mem: pool %#llx+%#llx (%s) stays imported: %s", (unsigned long long)r->lo, (unsigned long long)r->size,
                f, what);
     }
-    InterlockedAdd64(&m_refused_bytes[why], (LONG64)n);
+    __atomic_add_fetch(&m_refused_bytes[why], (int64_t)n, __ATOMIC_SEQ_CST);
 }
 
 // Replay thread: the pool's mirror on its first buffer use.
@@ -1084,12 +1083,12 @@ static void mirror_create(PoolRec *r) {
     r->mstate = MS_REFUSED;
     __atomic_add_fetch(&mirror_gen, 1, __ATOMIC_RELEASE);
     if (r->kind != POOL_IMPORT || !r->buf || !n) return;
-    AcquireSRWLockShared(&pool_lock);
+    plat_mutex_lock_shared(&pool_lock);
     int i = pidx_upper(&pool_index, r->lo) - 1;
     while (i >= 0 && pool_index.e[i].buf != r) i--;
     int alone = i >= 0 && (i == 0 || pool_index.maxhi[i - 1] <= pool_index.e[i].lo) &&
                 (i + 1 == pool_index.n || pool_index.e[i + 1].lo >= pool_index.e[i].hi);
-    ReleaseSRWLockShared(&pool_lock);
+    plat_mutex_unlock_shared(&pool_lock);
     if (i < 0) return;   // finalized meanwhile
     if (!alone) return refuse(r, MR_OVERLAP, "it overlaps another pool");
     uint64_t r0 = r->import_lo >> SNAP_SHIFT, r1 = (r->import_hi - 1) >> SNAP_SHIFT;
@@ -1102,12 +1101,12 @@ static void mirror_create(PoolRec *r) {
                  n / 1048576.0, used / 1048576.0, budget / 1048576.0);
         return refuse(r, MR_BUDGET, why);
     }
-    AcquireSRWLockExclusive(&gen_lock);
+    plat_mutex_lock(&gen_lock);
     mrep.sync_queries += snap_regions(r0, r1, mepoch);
     int untracked = 0;
     for (uint64_t k = r0; k <= r1; k++) untracked |= snap_untracked[k];
     r->mgen = gen_now;   // the whole-range copy below holds every write observed so far
-    ReleaseSRWLockExclusive(&gen_lock);
+    plat_mutex_unlock(&gen_lock);
     if (untracked) return refuse(r, MR_UNTRACKED, "its range is not write-watched");
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n, .usage = pool_usage(c),
                              .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
@@ -1120,20 +1119,20 @@ static void mirror_create(PoolRec *r) {
         snprintf(why, sizeof why, "device-local allocation of %.1f MiB failed (%d)", n / 1048576.0, (int)res);
         return refuse(r, MR_ALLOC, why);
     }
-    AcquireSRWLockExclusive(&pool_lock);
+    plat_mutex_lock(&pool_lock);
     if (nm == mcap) grow((void **)&mlist, &mcap, sizeof *mlist);
     int at = nm;
     while (at > 0 && mlist[at - 1]->import_lo > r->import_lo) at--;
     memmove(mlist + at + 1, mlist + at, (size_t)(nm - at) * sizeof *mlist);
     mlist[at] = r;
     nm++;
-    ReleaseSRWLockExclusive(&pool_lock);
+    plat_mutex_unlock(&pool_lock);
     r->acc_sub = msub;
     r->mstate = MS_ON;
     range_add(&pend, &npend, &cpend, r, 0, n);
     mrep.first_n++, mrep.first_bytes += n;
-    InterlockedIncrement64(&m_live_n);
-    InterlockedAdd64(&m_live_bytes, (LONG64)n);
+    __atomic_add_fetch(&m_live_n, 1, __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&m_live_bytes, (int64_t)n, __ATOMIC_SEQ_CST);
 }
 
 static void mirror_forget(PoolRec *r) {
@@ -1142,8 +1141,8 @@ static void mirror_forget(PoolRec *r) {
         if (mlist[i] == r) {
             memmove(mlist + i, mlist + i + 1, (size_t)(nm - i - 1) * sizeof *mlist);
             nm--;
-            InterlockedDecrement64(&m_live_n);
-            InterlockedAdd64(&m_live_bytes, -(LONG64)(r->import_hi - r->import_lo));
+            __atomic_sub_fetch(&m_live_n, 1, __ATOMIC_SEQ_CST);
+            __atomic_add_fetch(&m_live_bytes, -(int64_t)(r->import_hi - r->import_lo), __ATOMIC_SEQ_CST);
             break;
         }
 }
@@ -1151,20 +1150,20 @@ static void mirror_forget(PoolRec *r) {
 // Finalized mirrored pools waiting for mirror_retire; vk_mem_shutdown destroys those whose callback never ran.
 static PoolRec **retiring;
 static int nretiring, cretiring;
-static SRWLOCK retire_lock = SRWLOCK_INIT;
+static PlatMutex retire_lock = PLAT_MUTEX_INIT;
 
 static void mirror_retiring(PoolRec *r) {
-    AcquireSRWLockExclusive(&retire_lock);
+    plat_mutex_lock(&retire_lock);
     if (nretiring == cretiring) grow((void **)&retiring, &cretiring, sizeof *retiring);
     retiring[nretiring++] = r;
-    ReleaseSRWLockExclusive(&retire_lock);
+    plat_mutex_unlock(&retire_lock);
 }
 
 static void mirror_retire(void *arg) {
-    AcquireSRWLockExclusive(&retire_lock);
+    plat_mutex_lock(&retire_lock);
     for (int i = 0; i < nretiring; i++)
         if (retiring[i] == arg) { retiring[i] = retiring[--nretiring]; break; }
-    ReleaseSRWLockExclusive(&retire_lock);
+    plat_mutex_unlock(&retire_lock);
     destroy_rec(vk_ctx(), arg);
 }
 
@@ -1175,12 +1174,12 @@ static void mirror_sync(PoolRec *r) {
     uint64_t lo = r->import_lo, hi = r->import_hi;
     uint64_t r0 = lo >> SNAP_SHIFT, r1 = (hi - 1) >> SNAP_SHIFT;
     int excl = 0;
-    AcquireSRWLockShared(&gen_lock);
+    plat_mutex_lock_shared(&gen_lock);
     for (uint64_t k = r0; k <= r1; k++)
         if (snap_at[k] != mepoch) { excl = 1; break; }
     if (excl) {
-        ReleaseSRWLockShared(&gen_lock);
-        AcquireSRWLockExclusive(&gen_lock);
+        plat_mutex_unlock_shared(&gen_lock);
+        plat_mutex_lock(&gen_lock);
         mrep.sync_queries += snap_regions(r0, r1, mepoch);
     }
     uint32_t since = r->mgen;
@@ -1196,13 +1195,13 @@ static void mirror_sync(PoolRec *r) {
                 range_add(&pend, &npend, &cpend, r, x - lo, 1ull << GEN_PAGE_SHIFT);
     }
     r->mgen = gen_now;
-    if (excl) ReleaseSRWLockExclusive(&gen_lock);
-    else ReleaseSRWLockShared(&gen_lock);
+    if (excl) plat_mutex_unlock(&gen_lock);
+    else plat_mutex_unlock_shared(&gen_lock);
     if (__atomic_load_n(&r->fl_hi, __ATOMIC_ACQUIRE)) {
-        AcquireSRWLockExclusive(&flush_lock);
+        plat_mutex_lock(&flush_lock);
         uint64_t a = r->fl_lo, b = r->fl_hi;
         r->fl_hi = 0;
-        ReleaseSRWLockExclusive(&flush_lock);
+        plat_mutex_unlock(&flush_lock);
         a = a > lo ? a & ~0xfffull : lo;
         b = b < hi ? (b + 0xfff) & ~0xfffull : hi;
         if (a < b) range_add(&pend, &npend, &cpend, r, a - lo, b - a);
@@ -1242,22 +1241,22 @@ void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size) {
 
 void nvn_pool_flushed(const pool_t *p, uint64_t off, uint64_t size) {
     if (!vk_mirror_on || !size || !p->mem) return;
-    InterlockedIncrement64(&m_flush_calls);
-    InterlockedAdd64(&m_flush_bytes, (LONG64)size);
-    AcquireSRWLockShared(&pool_lock);
+    __atomic_add_fetch(&m_flush_calls, 1, __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&m_flush_bytes, (int64_t)size, __ATOMIC_SEQ_CST);
+    plat_mutex_lock_shared(&pool_lock);
     const pidx_ent *e = pidx_find(&pool_index, (uintptr_t)p->mem, 0);
     PoolRec *r = e && e->key == p ? e->buf : NULL;
     if (r && r->mstate == MS_ON) {
         uint64_t a = (uintptr_t)p->mem + off, b = a + size;
-        AcquireSRWLockExclusive(&flush_lock);
+        plat_mutex_lock(&flush_lock);
         if (!r->fl_hi) r->fl_lo = a, r->fl_hi = b;
         else {
             if (a < r->fl_lo) r->fl_lo = a;
             if (b > r->fl_hi) r->fl_hi = b;
         }
-        ReleaseSRWLockExclusive(&flush_lock);
+        plat_mutex_unlock(&flush_lock);
     }
-    ReleaseSRWLockShared(&pool_lock);
+    plat_mutex_unlock_shared(&pool_lock);
 }
 
 // gen_lock exclusive: freezes up to FREEZE_PER_SUB candidate regions still idle. The query after the
@@ -1275,10 +1274,10 @@ static void freeze_pass(void) {
 void vk_mem_mirror_begin(void) {
     if (!vk_mirror_on) {   // import mode: the texture checks' snapshots still skip frozen regions
         if (!freeze_idle) return;
-        AcquireSRWLockExclusive(&gen_lock);
+        plat_mutex_lock(&gen_lock);
         ww_ep++;
         freeze_pass();
-        ReleaseSRWLockExclusive(&gen_lock);
+        plat_mutex_unlock(&gen_lock);
         return;
     }
     uint64_t t0 = qpc();
@@ -1288,8 +1287,8 @@ void vk_mem_mirror_begin(void) {
     mepoch = vk_texture_epoch();
     uint64_t q = 0, run0 = 0, run1 = 0;
     int have = 0;
-    AcquireSRWLockShared(&pool_lock);
-    AcquireSRWLockExclusive(&gen_lock);
+    plat_mutex_lock_shared(&pool_lock);
+    plat_mutex_lock(&gen_lock);
     ww_ep++;
     uint64_t b0 = ww_bytes;
     for (int i = 0; i < nm; i++) {
@@ -1306,8 +1305,8 @@ void vk_mem_mirror_begin(void) {
     if (have) q += snap_regions(run0, run1, mepoch);
     mrep.presnap_bytes += ww_bytes - b0;
     if (freeze_idle) freeze_pass();
-    ReleaseSRWLockExclusive(&gen_lock);
-    ReleaseSRWLockShared(&pool_lock);
+    plat_mutex_unlock(&gen_lock);
+    plat_mutex_unlock_shared(&pool_lock);
     mrep.subs++;
     mrep.presnap_queries += q;
     mrep.presnap_t += qpc() - t0;
@@ -1342,7 +1341,7 @@ static int page_dirty(uint64_t a, uint32_t mgen) {
 
 static void verify_cb(void *arg) {   // completion thread
     VJob *j = arg;
-    static volatile LONG logged;
+    static volatile int32_t logged;
     uint64_t pages = 0, skipped = 0, bad = 0;
     for (int i = 0; i < j->n; i++) {
         const VSample *s = &j->s[i];
@@ -1359,7 +1358,7 @@ static void verify_cb(void *arg) {   // completion thread
             if (!memcmp(m, g, 1ull << GEN_PAGE_SHIFT)) continue;
             if (page_dirty(a, s->mgen)) { skipped++; continue; }
             bad++;
-            if (InterlockedIncrement(&logged) <= VERIFY_LOG) {
+            if (__atomic_add_fetch(&logged, 1, __ATOMIC_SEQ_CST) <= VERIFY_LOG) {
                 int k = 0, e = (1 << GEN_PAGE_SHIFT) - 1;
                 while (k < e && m[k] == g[k]) k++;
                 while (e > k && m[e] == g[e]) e--;
@@ -1371,9 +1370,9 @@ static void verify_cb(void *arg) {   // completion thread
             }
         }
     }
-    InterlockedAdd64(&v_pages, (LONG64)pages);
-    InterlockedAdd64(&v_skipped, (LONG64)skipped);
-    InterlockedAdd64(&v_mismatch, (LONG64)bad);
+    __atomic_add_fetch(&v_pages, (int64_t)pages, __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&v_skipped, (int64_t)skipped, __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&v_mismatch, (int64_t)bad, __ATOMIC_SEQ_CST);
     vmaDestroyBuffer(vk_ctx()->vma, j->buf, j->alloc);
     free(j);
 }
@@ -1382,7 +1381,7 @@ static int verify_record(VkCommandBuffer cb, uint64_t fence) {
     VJob *j = calloc(1, sizeof *j);
     if (!j) rt_fatal("vk: out of memory");
     uint64_t left = VERIFY_BYTES, dst = 0;
-    AcquireSRWLockShared(&pool_lock);
+    plat_mutex_lock_shared(&pool_lock);
     for (int tries = 0; nm && left && j->n < VERIFY_SAMPLES && tries <= nm; tries++) {
         if (ver_i >= nm) ver_i = 0, ver_off = 0;
         PoolRec *r = mlist[ver_i];
@@ -1393,7 +1392,7 @@ static int verify_record(VkCommandBuffer cb, uint64_t fence) {
         dst += len, left -= len, ver_off += len;
         if (ver_off >= size) ver_i++, ver_off = 0;
     }
-    ReleaseSRWLockShared(&pool_lock);
+    plat_mutex_unlock_shared(&pool_lock);
     if (!j->n) { free(j); return 0; }
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = dst,
                              .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
@@ -1430,10 +1429,10 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
         nwbl = 0;
     }
     if (mirror_verify) rec += verify_record(cb, fence);
-    AcquireSRWLockExclusive(&mirror_stat_lock);
+    plat_mutex_lock(&mirror_stat_lock);
     uint64_t *d = (uint64_t *)&macc, *s = (uint64_t *)&mrep;
     for (size_t i = 0; i < sizeof macc / sizeof(uint64_t); i++) d[i] += s[i];
-    ReleaseSRWLockExclusive(&mirror_stat_lock);
+    plat_mutex_unlock(&mirror_stat_lock);
     memset(&mrep, 0, sizeof mrep);
     return rec;
 }
@@ -1441,12 +1440,12 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
 // One summary line: with TOTK_TRACE=perf every 60 frames, else at frames 600 and 1800.
 static void mirror_log(uint64_t frame) {
     static uint64_t last, ww_last;
-    AcquireSRWLockExclusive(&gen_lock);
+    plat_mutex_lock(&gen_lock);
     uint64_t wc = ww_calls, wb = ww_bytes, wt = ww_ticks, dc = ww_dirty_calls, dt = ww_dirty_ticks, wp = ww_pages;
     ww_pages = 0;
     uint64_t nr = n_frz_refused;
     ww_calls = ww_bytes = ww_ticks = ww_dirty_calls = ww_dirty_ticks = n_frz_refused = 0;
-    ReleaseSRWLockExclusive(&gen_lock);
+    plat_mutex_unlock(&gen_lock);
     double wf = frame > ww_last ? (double)(frame - ww_last) : 1.0;
     ww_last = frame;
     uint64_t fz, ff, ft, fo;
@@ -1458,18 +1457,18 @@ static void mirror_log(uint64_t frame) {
                (unsigned long long)frame, wc / wf, wb / wf / 1048576.0, qpc_ms(wt) / wf, dc / wf, wp / wf, qpc_ms(dt) / wf,
                fz * 2.0, (unsigned long long)ff, (unsigned long long)ft, (unsigned long long)fo, (unsigned long long)nr);
     if (!vk_mirror_on) return;
-    AcquireSRWLockExclusive(&mirror_stat_lock);
+    plat_mutex_lock(&mirror_stat_lock);
     MirrorAcc a = macc;
     memset(&macc, 0, sizeof macc);
-    ReleaseSRWLockExclusive(&mirror_stat_lock);
+    plat_mutex_unlock(&mirror_stat_lock);
     double f = frame > last ? (double)(frame - last) : 1.0, M = 1048576.0;
     last = frame;
-    uint64_t fc = (uint64_t)InterlockedExchange64(&m_flush_calls, 0), fb = (uint64_t)InterlockedExchange64(&m_flush_bytes, 0);
+    uint64_t fc = (uint64_t)__atomic_exchange_n(&m_flush_calls, 0, __ATOMIC_SEQ_CST), fb = (uint64_t)__atomic_exchange_n(&m_flush_bytes, 0, __ATOMIC_SEQ_CST);
     char ver[160] = "";
     if (mirror_verify)
         snprintf(ver, sizeof ver, "; verify: pages compared %lld, skipped %lld (written since), mismatches %lld",
-                 (long long)InterlockedExchange64(&v_pages, 0), (long long)InterlockedExchange64(&v_skipped, 0),
-                 (long long)InterlockedExchange64(&v_mismatch, 0));
+                 (long long)__atomic_exchange_n(&v_pages, 0, __ATOMIC_SEQ_CST), (long long)__atomic_exchange_n(&v_skipped, 0, __ATOMIC_SEQ_CST),
+                 (long long)__atomic_exchange_n(&v_mismatch, 0, __ATOMIC_SEQ_CST));
     rt_log("mem: mirror frame %llu: pools %lld, %.1f MiB device-local; stay imported: budget %lld (%.1f MiB), untracked "
            "%lld, overlapping %lld, failed %lld; per frame: submits %.2f, syncs %.1f, upload %.3f MiB in %.1f ranges, "
            "first use %.2f pools %.3f MiB, write-back %.3f MiB in %.1f ranges, flush calls %.1f (%.3f MiB), queries "
@@ -1560,8 +1559,8 @@ typedef struct {
 enum { DEAD_IMAGE = 1, DEAD_IMAGE_VMA, DEAD_VIEW, DEAD_BUFFER_VMA };
 typedef struct { int kind; uint64_t handle; VmaAllocation alloc; uint64_t seq, tl; } Dead;
 
-static CRITICAL_SECTION cmd_lock;
-static INIT_ONCE cmd_once = INIT_ONCE_STATIC_INIT;
+static PlatRecMutex cmd_lock;
+static PlatOnce cmd_once = PLAT_ONCE_INIT;
 static VkCommandPool cmd_pool;
 static Batch open_b;
 static int open_active;
@@ -1574,10 +1573,7 @@ static Dead *dead;
 static int ndead, cap_dead;
 static uint64_t tl_noted;             // newest timeline value vk_sync.c reported submitted
 
-static BOOL CALLBACK cmd_init(PINIT_ONCE o, PVOID p, PVOID *ctx) {
-    (void)o, (void)p, (void)ctx;
-    InitializeCriticalSection(&cmd_lock);
-    return TRUE;
+static void cmd_init(void) {
 }
 
 static void grow(void **arr, int *cap, size_t elem) {
@@ -1627,8 +1623,8 @@ static void collect_locked(VkCtx *c) {
 }
 
 VkCommandBuffer vk_upload_begin(void) {
-    InitOnceExecuteOnce(&cmd_once, cmd_init, NULL, NULL);
-    EnterCriticalSection(&cmd_lock);
+    plat_once(&cmd_once, cmd_init);
+    plat_rmutex_lock(&cmd_lock);
     VkCtx *c = vk_ctx();
     if (!c) rt_fatal("vk: upload before vk_init");
     if (open_active) return open_b.cb;
@@ -1661,7 +1657,7 @@ VkCommandBuffer vk_upload_begin(void) {
     return open_b.cb;
 }
 
-void vk_upload_end(void) { LeaveCriticalSection(&cmd_lock); }
+void vk_upload_end(void) { plat_rmutex_unlock(&cmd_lock); }
 
 // Staging memory comes from a pool of its own that keeps STG_MIN_BLOCKS blocks from its first use (at boot). In the
 // default pools VMA creates a block under the lock of its memory type (VmaBlockVector::Allocate), so a block made by
@@ -1680,8 +1676,8 @@ void *vk_staging(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc) {
     VmaAllocationCreateInfo aci = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
                                    .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
     if (!__atomic_load_n(&stg_pool_tried, __ATOMIC_ACQUIRE)) {
-        InitOnceExecuteOnce(&cmd_once, cmd_init, NULL, NULL);
-        EnterCriticalSection(&cmd_lock);
+        plat_once(&cmd_once, cmd_init);
+        plat_rmutex_lock(&cmd_lock);
         if (!stg_pool_tried) {
             uint32_t type;
             VmaPoolCreateInfo pi = {.blockSize = STG_BLOCK, .minBlockCount = STG_MIN_BLOCKS};
@@ -1693,7 +1689,7 @@ void *vk_staging(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc) {
                    STG_MIN_BLOCKS, (unsigned long long)(STG_BLOCK >> 20));
             __atomic_store_n(&stg_pool_tried, 1, __ATOMIC_RELEASE);
         }
-        LeaveCriticalSection(&cmd_lock);
+        plat_rmutex_unlock(&cmd_lock);
     }
     if (stg_pool && bi.size <= STG_BLOCK / 2) aci.pool = stg_pool;
     VmaAllocationInfo info;
@@ -1711,8 +1707,8 @@ void *vk_staging(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc) {
 }
 
 uint64_t vk_upload_flush(int wait) {
-    InitOnceExecuteOnce(&cmd_once, cmd_init, NULL, NULL);
-    EnterCriticalSection(&cmd_lock);
+    plat_once(&cmd_once, cmd_init);
+    plat_rmutex_lock(&cmd_lock);
     VkCtx *c = vk_ctx();
     uint64_t seq = next_seq;
     if (c && open_active) {
@@ -1734,24 +1730,24 @@ uint64_t vk_upload_flush(int wait) {
         }
     }
     if (c) collect_locked(c);
-    LeaveCriticalSection(&cmd_lock);
+    plat_rmutex_unlock(&cmd_lock);
     return seq;
 }
 
 static void defer(int kind, uint64_t handle, VmaAllocation alloc) {
-    InitOnceExecuteOnce(&cmd_once, cmd_init, NULL, NULL);
-    EnterCriticalSection(&cmd_lock);
+    plat_once(&cmd_once, cmd_init);
+    plat_rmutex_lock(&cmd_lock);
     if (ndead == cap_dead) grow((void **)&dead, &cap_dead, sizeof *dead);
     // The open batch may record into the object: it counts as the newest user.
     dead[ndead++] = (Dead){kind, handle, alloc, open_active ? open_b.seq : next_seq, tl_noted};
-    LeaveCriticalSection(&cmd_lock);
+    plat_rmutex_unlock(&cmd_lock);
 }
 
 static int dead_pending(void) {
-    InitOnceExecuteOnce(&cmd_once, cmd_init, NULL, NULL);
-    EnterCriticalSection(&cmd_lock);
+    plat_once(&cmd_once, cmd_init);
+    plat_rmutex_lock(&cmd_lock);
     int n = ndead;
-    LeaveCriticalSection(&cmd_lock);
+    plat_rmutex_unlock(&cmd_lock);
     return n;
 }
 
@@ -1764,31 +1760,31 @@ void vk_defer_buffer(VkBuffer buf, VmaAllocation alloc) {
 }
 
 void vk_mem_note_submit(uint64_t timeline_value) {
-    InitOnceExecuteOnce(&cmd_once, cmd_init, NULL, NULL);
-    EnterCriticalSection(&cmd_lock);
+    plat_once(&cmd_once, cmd_init);
+    plat_rmutex_lock(&cmd_lock);
     if (timeline_value > tl_noted) tl_noted = timeline_value;
-    LeaveCriticalSection(&cmd_lock);
+    plat_rmutex_unlock(&cmd_lock);
 }
 
 void vk_mem_collect(void) {
     VkCtx *c = vk_ctx();
     if (!c) return;
-    InitOnceExecuteOnce(&cmd_once, cmd_init, NULL, NULL);
-    EnterCriticalSection(&cmd_lock);
+    plat_once(&cmd_once, cmd_init);
+    plat_rmutex_lock(&cmd_lock);
     collect_locked(c);
-    LeaveCriticalSection(&cmd_lock);
+    plat_rmutex_unlock(&cmd_lock);
 }
 
 void vk_mem_stats(VkMemStats *s) {
     memset(s, 0, sizeof *s);
-    AcquireSRWLockShared(&pool_lock);
+    plat_mutex_lock_shared(&pool_lock);
     for (int i = 0; i < pool_index.n; i++) {
         const PoolRec *r = pool_index.e[i].buf;
         if (r->kind == POOL_IMPORT) s->imported_pools++;
         else if (r->kind == POOL_PHYS) s->physical_pools++;
         else s->virtual_pools++;
     }
-    ReleaseSRWLockShared(&pool_lock);
+    plat_mutex_unlock_shared(&pool_lock);
     s->import_failures = (uint64_t)n_import_failures;
     s->upload_batches = next_seq;
 }
@@ -1801,7 +1797,7 @@ void vk_mem_shutdown(void) {
     vkDeviceWaitIdle(c->device);
     vk_queue_unlock();
     vk_texture_shutdown();
-    EnterCriticalSection(&cmd_lock);
+    plat_rmutex_lock(&cmd_lock);
     retire(c, 1);
     uint64_t keep = tl_noted;
     tl_noted = 0;
@@ -1818,8 +1814,8 @@ void vk_mem_shutdown(void) {
     if (stg_pool) vmaDestroyPool(c->vma, stg_pool);   // after retire: no staging buffer is left in it
     stg_pool = NULL;
     stg_pool_tried = 0;
-    LeaveCriticalSection(&cmd_lock);
-    AcquireSRWLockExclusive(&pool_lock);
+    plat_rmutex_unlock(&cmd_lock);
+    plat_mutex_lock(&pool_lock);
     for (int i = 0; i < pool_index.n; i++) destroy_rec(c, pool_index.e[i].buf);
     pool_index.n = 0;
     nm = npend = nwbl = 0;   // mirrors went with their pools
@@ -1827,8 +1823,8 @@ void vk_mem_shutdown(void) {
     nretiring = 0;
     __atomic_add_fetch(&pool_gen, 1, __ATOMIC_RELEASE);
     nphys = 0;
-    ReleaseSRWLockExclusive(&pool_lock);
-    AcquireSRWLockExclusive(&gen_lock);
+    plat_mutex_unlock(&pool_lock);
+    plat_mutex_lock(&gen_lock);
     for (uint64_t i = 0; i < GEN_CHUNKS; i++) free(gen_chunk[i]), gen_chunk[i] = NULL;
-    ReleaseSRWLockExclusive(&gen_lock);
+    plat_mutex_unlock(&gen_lock);
 }

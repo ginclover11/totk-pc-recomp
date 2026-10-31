@@ -163,11 +163,11 @@ static void add(char *key, char *value, int line) {
     for (int i = 0; i < n_entries; i++)
         if (!strcmp(entries[i].key, key)) {   // a repeated key: the later line wins
             free(entries[i].value);
-            entries[i].value = _strdup(value);
+            entries[i].value = strdup(value);
             return;
         }
     if (n_entries == CFG_MAX_KEYS) return;
-    entries[n_entries++] = (CfgEntry){_strdup(key), _strdup(value), 0, 0};
+    entries[n_entries++] = (CfgEntry){strdup(key), strdup(value), 0, 0};
 }
 
 int cfg_load(const char *path) {
@@ -201,7 +201,7 @@ const char *cfg_get(const char *name) {
     if (e || strncmp(name, PREFIX, PREFIX_LEN)) return e;
     int n = __atomic_load_n(&n_entries, __ATOMIC_ACQUIRE);
     for (int i = 0; i < n; i++)
-        if (!_stricmp(entries[i].key, name + PREFIX_LEN)) return __atomic_load_n(&entries[i].value, __ATOMIC_ACQUIRE);
+        if (!strcasecmp(entries[i].key, name + PREFIX_LEN)) return __atomic_load_n(&entries[i].value, __ATOMIC_ACQUIRE);
     return NULL;
 }
 
@@ -219,12 +219,12 @@ void cfg_set(const char *name, const char *value) {
     while (i < n && strcmp(entries[i].key, key)) i++;
     if (i < n) {
         if (!entries[i].value || strcmp(entries[i].value, value)) {
-            __atomic_store_n(&entries[i].value, _strdup(value), __ATOMIC_RELEASE);   // the old string stays for readers
+            __atomic_store_n(&entries[i].value, strdup(value), __ATOMIC_RELEASE);   // the old string stays for readers
             entries[i].dirty = 1;
         }
         entries[i].removed = 0;   // a value set after cfg_reset replaces the line instead of deleting it
     } else if (n < CFG_MAX_KEYS) {
-        entries[n] = (CfgEntry){_strdup(key), _strdup(value), 1, 0};
+        entries[n] = (CfgEntry){strdup(key), strdup(value), 1, 0};
         __atomic_store_n(&n_entries, n + 1, __ATOMIC_RELEASE);
     }
     __atomic_add_fetch(&version, 1, __ATOMIC_RELEASE);
@@ -244,7 +244,7 @@ int cfg_reset(const char *const *keys, int n) {
         while (i < n_entries && strcmp(entries[i].key, name)) i++;
         if (i == n_entries) {   // no value in memory ("key =" in the file): the line still has to go
             if (i == CFG_MAX_KEYS) continue;
-            entries[i] = (CfgEntry){_strdup(name), NULL, 0, 1};
+            entries[i] = (CfgEntry){strdup(name), NULL, 0, 1};
             __atomic_store_n(&n_entries, i + 1, __ATOMIC_RELEASE);
         } else if (entries[i].value) {
             __atomic_store_n(&entries[i].value, NULL, __ATOMIC_RELEASE);   // the old string stays for readers
@@ -540,7 +540,7 @@ static int find_ini(void) {
     if (ini_path[0]) return 1;
     char path[1024];
     if (!plat_exe_path(path, sizeof path)) return 0;
-    char *cut = strrchr(path, '\\');
+    char *cut = strrchr(path, PLAT_SEP[0]);
     if (!cut) cut = strrchr(path, '/');
     if (!cut || cut + 10 >= path + sizeof path) return 0;
     strcpy(cut + 1, "totk.ini");

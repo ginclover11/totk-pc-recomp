@@ -1,5 +1,7 @@
 # Building from source
 
+Linux is a port in progress, see [Linux](#linux) at the end; the rest of this page is Windows.
+
 Windows 10 or later, an x86-64 CPU with AVX2, and a GPU with Vulkan 1.3 and `VK_EXT_external_memory_host`. Allow about
 60 GB for the work folder. Extraction wants about 55 GB free while it runs and keeps about 35 GB afterwards.
 
@@ -124,6 +126,8 @@ Before a commit:
 - `python tools/check_content.py --staged`: nothing game-derived is staged. CI runs the same check;
   `git config core.hooksPath .githooks` runs it before each local commit.
 - `build\<ver>\totk.exe --selftest`: layout, dispatch table and host-function registry, without game files.
+- `python tools/check_platform.py`: no Win32 in shared runtime code. CI runs it too, and builds Windows from the fixture
+  (`.github/workflows/portable-build.yml`).
 
 The lifter (`recomp/`) and the CPU headers (`runtime/cpu.h`, `runtime/simd.h`) are checked against Unicorn. Every lifter
 change passes these, all run with `.venv`:
@@ -149,3 +153,51 @@ to `build\<ver>\shaders\` and runs it through the translator and `spirv-val`; fa
 
 - Ghidra 12.1.2 with Adubbz's Ghidra-Switch-Loader in `toolchain\ghidra\` (JDK 21) opens the game modules (NSO).
 - `tools\fetch_refs.sh` clones the upstream projects this port builds on into `refs\`, read-only.
+
+## Linux
+
+What works today: the extraction, the lifter, the translator and the build all run on Linux, and the game boots to its
+first NVN call (`--boot` with `TOTK_GPU=null`). There is no window, input or audio output yet (`gfx_window_posix.c` and
+`input_posix.c` are stand-ins), so the game does not reach the screen. `tools/run_game.py`, `tools/package_build.py`,
+`tools/build_shaders.py` and the installer still expect Windows.
+
+Verified on CachyOS with kernel 7.3, Clang and LLD 23, and an NVIDIA RTX 5060 on driver 615. The memory tracking needs
+kernel 6.7 or later (`PAGEMAP_SCAN`).
+
+```sh
+sudo pacman -S --needed clang lld ninja gcc make sdl3 opus libvpx zstd vulkan-headers vulkan-icd-loader \
+    vulkan-memory-allocator dotnet-sdk spirv-tools
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -r tools/requirements.txt
+uv venv --python 3.14 .venv-py314
+uv pip install --python .venv-py314/bin/python -r tools/requirements-py314.txt
+```
+
+Without the game, a fixture stands in for the lifted code and holds no game code:
+
+```sh
+.venv/bin/python tools/make_fixture.py
+.venv/bin/python tools/build_game.py --version fixture --expected generated/fixture/expected.json
+build/fixture/totk --selftest
+build/fixture/totk --probe-platform      # locks, fibers, write tracking, the file calls the save commit stands on
+build/fixture/totk --probe-preempt       # the preemption signal against a loop that checks every register
+```
+
+With the game, after writing `config.local.toml` as in step 2 above:
+
+```sh
+.venv/bin/python tools/build_hactool.py
+.venv-py314/bin/python tools/extract.py
+.venv/bin/python tools/build_xlate.py
+.venv/bin/python recomp/gen.py --exefs build/extracted/v143/exefs --out generated/v143 --patches recomp/patches-v143.txt
+.venv-py314/bin/python tools/make_romfs_patches.py --version v143
+.venv/bin/python tools/build_game.py --version v143
+build/v143/totk --selftest
+TOTK_GPU=null build/v143/totk --boot
+```
+
+`--probe-loader`, `--probe-kernel`, `--probe-ipc`, `--probe-services`, `--probe-fs`, `--probe-gfx-abi`, `--probe-cfg`,
+`--probe-astc` and `--probe-movie` run the same way. The window cases of `--probe-services` are Windows only. The Unicorn
+checks of [Checks](#checks) run with `.venv/bin/python`; pass `--exefs build/extracted/v143/exefs` to those that take game
+files. `tests/excl_mt.py` reports ABA failures on both systems: `cpu.h` emulates the exclusive monitor with
+compare-and-swap, which cannot see them.

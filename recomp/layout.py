@@ -27,12 +27,16 @@ def align_up(v, a=ALIGN):
 def layout(exefs):
     """[(name, base, size)] for the modules present in the ExeFS directory, in load order."""
     exefs = Path(exefs)
+    return place({name: Nso(str(exefs / name)).size for name in ORDER if (exefs / name).exists()})
+
+
+def place(sizes):
+    """[(name, base, size)] for the modules in sizes ({name: bytes}), in load order."""
     out, base = [], FIRST_BASE
     for name in ORDER:
-        path = exefs / name
-        if not path.exists():
+        if name not in sizes:
             continue
-        size = Nso(str(path)).size
+        size = sizes[name]
         out.append((name, base, size))
         base = align_up(base + size)
     if base > ADDRESS_LIMIT:

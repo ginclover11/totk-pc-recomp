@@ -5,23 +5,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
-
+#include "platform/platform.h"
 #include "cfg.h"
 #include "host.h"
 #include "vk.h"
 
 static VkCtx g_vk;
 static int g_ready;
-static SRWLOCK g_lock = SRWLOCK_INIT;
+static PlatMutex g_lock = PLAT_MUTEX_INIT;
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBitsEXT sev, VkDebugUtilsMessageTypeFlagsEXT type,
                                                const VkDebugUtilsMessengerCallbackDataEXT *d, void *user) {
     (void)type, (void)user;
     int err = (sev & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0;
-    if (err) InterlockedIncrement(&g_vk.validation_errors);
+    if (err) __atomic_add_fetch(&g_vk.validation_errors, 1, __ATOMIC_SEQ_CST);
     static volatile long logged;
-    if (InterlockedIncrement(&logged) <= 500) rt_log("vk validation %s: %s", err ? "error" : "warning", d->pMessage);
+    if (__atomic_add_fetch(&logged, 1, __ATOMIC_SEQ_CST) <= 500) rt_log("vk validation %s: %s", err ? "error" : "warning", d->pMessage);
     return VK_FALSE;
 }
 
@@ -42,8 +41,14 @@ static int layer_present(const char *name) {
 }
 
 static int create_instance(void) {
-    const char *ext[4] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
+#ifdef _WIN32
+    const char *ext[8] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
     uint32_t n_ext = 2;
+#else
+    // The surface extensions the window's backend asks for; SDL knows them once its video subsystem runs.
+    const char *ext[8];
+    uint32_t n_ext = gfx_window_instance_exts(ext, 6);
+#endif
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
     int validate = cfg_bool("TOTK_VK_VALIDATION");
     if (validate && !layer_present(layers[0])) {
@@ -91,18 +96,22 @@ static const char *missing_required(VkPhysicalDevice pd) {
     return miss;
 }
 
-// Graphics+compute family that can present on win32.
+// Graphics+compute family that can present on this system's windows.
 static uint32_t find_gfx_family(VkPhysicalDevice pd, const VkQueueFamilyProperties *qp, uint32_t nq) {
     for (uint32_t i = 0; i < nq; i++)
         if ((qp[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && (qp[i].queueFlags & VK_QUEUE_COMPUTE_BIT) &&
+#ifdef _WIN32
             vkGetPhysicalDeviceWin32PresentationSupportKHR(pd, i))
+#else
+            gfx_window_present_support(g_vk.instance, pd, i))
+#endif
             return i;
     return UINT32_MAX;
 }
 
 static int name_has(const char *s, const char *sub) {
     for (size_t n = strlen(sub); *s; s++)
-        if (!_strnicmp(s, sub, n)) return 1;
+        if (!strncasecmp(s, sub, n)) return 1;
     return 0;
 }
 
@@ -345,21 +354,21 @@ static void destroy_all(void) {
 long vk_validation_errors_total(void) { return g_errors_total + (g_ready ? g_vk.validation_errors : 0); }
 
 int vk_init(void) {
-    AcquireSRWLockExclusive(&g_lock);
+    plat_mutex_lock(&g_lock);
     if (!g_ready) {
         memset(&g_vk, 0, sizeof g_vk);
         if (create_instance() && pick_device() && create_device()) g_ready = 1, vk_headroom_start();
         else destroy_all();
     }
     int ok = g_ready;
-    ReleaseSRWLockExclusive(&g_lock);
+    plat_mutex_unlock(&g_lock);
     return ok;
 }
 
 void vk_shutdown(void) {
-    AcquireSRWLockExclusive(&g_lock);
+    plat_mutex_lock(&g_lock);
     if (g_ready) { destroy_all(); g_ready = 0; }
-    ReleaseSRWLockExclusive(&g_lock);
+    plat_mutex_unlock(&g_lock);
 }
 
 VkCtx *vk_ctx(void) { return g_ready ? &g_vk : NULL; }

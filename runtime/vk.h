@@ -1,10 +1,15 @@
 // Vulkan-internal header of the graphics layer. Host code only; the guest never sees it.
 #pragma once
+#ifdef _WIN32
 #ifndef VK_USE_PLATFORM_WIN32_KHR
 #define VK_USE_PLATFORM_WIN32_KHR 1
 #endif
+#include <windows.h>
+#endif
 #include <vulkan/vulkan.h>
+#ifdef _WIN32
 #include <vulkan/vulkan_win32.h>
+#endif
 #include <stdint.h>
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wnullability-completeness"
@@ -97,7 +102,12 @@ void vk_queue_unlock(void);
 void vk_present_capture(int on);
 int vk_present_captured(const uint8_t **px, int *w, int *h, VkFormat *fmt);
 
+#ifndef _WIN32
+uint32_t gfx_window_instance_exts(const char **out, uint32_t max);   // gfx_window_posix.c: Vulkan's surface extensions
+int gfx_window_present_support(VkInstance instance, VkPhysicalDevice pd, uint32_t family);
+#else
 HWND gfx_window_handle(void);                      // NULL before gfx_window_start
+#endif
 void gfx_window_resize(int client_w, int client_h);   // programmatic resize; returns after the swapchain is rebuilt
 void gfx_vsync_bind_counter(volatile long *counter);  // host-side stand-in for a bound event: incremented per tick
 unsigned gfx_window_focus_messages(void);          // OE_MSG_FOCUS_STATE_CHANGED pushes made by the window thread

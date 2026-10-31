@@ -17,8 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
-
+#include "platform/platform.h"
 #include "cfg.h"
 #include "gfx.h"
 #include "host.h"
@@ -75,8 +74,8 @@ typedef struct {
 typedef struct { samp_par p; VkSampler s, sp; uint8_t used; } SampSlot;   // s: vk_sampler_for(&p) once looked up; sp:
                                                                            // its point-sampled form (vk_sampler_point_by_id_locked)
 
-static CRITICAL_SECTION tex_lock;
-static INIT_ONCE tex_once = INIT_ONCE_STATIC_INIT;
+static PlatRecMutex tex_lock;
+static PlatOnce tex_once = PLAT_ONCE_INIT;
 static nvn_hmap by_key = {.klen = sizeof(TexKey)};
 static nvn_hmap by_addr = {.klen = 8};
 static TexSlot *tslots;
@@ -96,7 +95,7 @@ static uint64_t n_alias_copied, n_alias_upload, n_alias_uninit;
 static uint32_t submit_epoch = 1;   // bumped per queue submit: draw bindings check a texture's storage once per submit
 // Mirrored textures the GPU wrote into, sorted by address (vk_texture_cpu_stale, vk_texture_write_back). Changed under
 // tex_lock and owned_lock; read under either.
-static SRWLOCK owned_lock = SRWLOCK_INIT;
+static PlatMutex owned_lock = PLAT_MUTEX_INIT;
 static Tex **owned;
 static int nowned, cowned;
 static uint64_t max_owned;   // largest storage size in owned[]
@@ -130,17 +129,14 @@ static void tex_gen_bump(uint64_t addr) {
 }
 
 static volatile long tex_ready;
-static BOOL CALLBACK tex_init(PINIT_ONCE o, PVOID p, PVOID *ctx) {
-    (void)o, (void)p, (void)ctx;
-    InitializeCriticalSection(&tex_lock);
+static void tex_init(void) {
     __atomic_store_n(&tex_ready, 1, __ATOMIC_RELEASE);
-    return TRUE;
 }
 static void lock(void) {
-    if (!__atomic_load_n(&tex_ready, __ATOMIC_ACQUIRE)) InitOnceExecuteOnce(&tex_once, tex_init, NULL, NULL);
-    EnterCriticalSection(&tex_lock);
+    if (!__atomic_load_n(&tex_ready, __ATOMIC_ACQUIRE)) plat_once(&tex_once, tex_init);
+    plat_rmutex_lock(&tex_lock);
 }
-static void unlock(void) { LeaveCriticalSection(&tex_lock); }
+static void unlock(void) { plat_rmutex_unlock(&tex_lock); }
 
 static uint32_t umax(uint32_t a, uint32_t b) { return a > b ? a : b; }
 static uint32_t mip(uint32_t v, unsigned lv) { return umax(v >> lv, 1); }
@@ -178,7 +174,7 @@ static int tex_mirrored(const tex_t *t) {
 
 static void log_limited(volatile long *n, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void log_limited(volatile long *n, const char *fmt, ...) {
-    if (InterlockedIncrement(n) > 16) return;
+    if (__atomic_add_fetch(n, 1, __ATOMIC_SEQ_CST) > 16) return;
     char buf[512];
     va_list ap;
     va_start(ap, fmt);
@@ -404,7 +400,7 @@ static int owned_lower(uint64_t a) {
 
 static void own_add(Tex *e) {
     if (e->listed) return;
-    AcquireSRWLockExclusive(&owned_lock);
+    plat_mutex_lock(&owned_lock);
     if (nowned == cowned) {
         cowned = cowned ? 2 * cowned : 256;
         if (!(owned = realloc(owned, sizeof *owned * (size_t)cowned))) rt_fatal("vk: out of memory for the owned-texture list");
@@ -415,12 +411,12 @@ static void own_add(Tex *e) {
     __atomic_store_n(&nowned, nowned + 1, __ATOMIC_RELEASE);
     if (e->t.L.size > max_owned) max_owned = e->t.L.size;
     e->listed = 1;
-    ReleaseSRWLockExclusive(&owned_lock);
+    plat_mutex_unlock(&owned_lock);
 }
 
 static void own_remove(Tex *e) {
     if (!e->listed) return;
-    AcquireSRWLockExclusive(&owned_lock);
+    plat_mutex_lock(&owned_lock);
     for (int i = owned_lower(e->pub.addr); i < nowned && owned[i]->pub.addr == e->pub.addr; i++)
         if (owned[i] == e) {
             memmove(owned + i, owned + i + 1, sizeof *owned * (size_t)(nowned - i - 1));
@@ -428,7 +424,7 @@ static void own_remove(Tex *e) {
             break;
         }
     e->listed = 0;
-    ReleaseSRWLockExclusive(&owned_lock);
+    plat_mutex_unlock(&owned_lock);
 }
 
 static void rel_append(Tex *e) {
@@ -1316,9 +1312,9 @@ size_t vk_texture_texel_span(const tex_t *t, const view_t *v, const NVNcopyRegio
 
 int vk_texture_cpu_stale(uint64_t addr, uint64_t size) {
     if (!size || !__atomic_load_n(&nowned, __ATOMIC_ACQUIRE)) return 0;
-    AcquireSRWLockShared(&owned_lock);
+    plat_mutex_lock_shared(&owned_lock);
     int dirty = owned_dirty(addr, size, NULL);
-    ReleaseSRWLockShared(&owned_lock);
+    plat_mutex_unlock_shared(&owned_lock);
     return dirty;
 }
 
@@ -1374,7 +1370,7 @@ int vk_texture_small_dirty(void) { return __atomic_load_n(&small_pending, __ATOM
 void vk_texture_write_back_small(uint64_t fence) {
     lock();
     __atomic_store_n(&small_pending, 0, __ATOMIC_RELAXED);
-    AcquireSRWLockShared(&owned_lock);
+    plat_mutex_lock_shared(&owned_lock);
     int n = 0, later = 0;
     for (int i = 0; i < nowned; i++) n += owned[i]->gpu_dirty && owned[i]->t.L.size <= WB_SMALL;
     Tex **hit = n ? malloc(sizeof *hit * (size_t)n) : NULL;
@@ -1386,7 +1382,7 @@ void vk_texture_write_back_small(uint64_t fence) {
         if (e->gpu_fence > fence) later = 1;
         else hit[n++] = e;
     }
-    ReleaseSRWLockShared(&owned_lock);
+    plat_mutex_unlock_shared(&owned_lock);
     if (later) __atomic_store_n(&small_pending, 1, __ATOMIC_RELEASE);
     int k = 0;
     for (int i = 0; i < n; i++) {

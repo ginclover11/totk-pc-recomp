@@ -1,0 +1,41 @@
+name: Portable build
+
+# Builds the runtime with a fixture in place of the game (tools/make_fixture.py: no game code) and runs the modes that
+# need no game files, on the Windows toolchain of docs/building.md. Linux is built the same way by hand for now.
+on:
+  push:
+  pull_request:
+
+jobs:
+  platform-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python tools/check_platform.py
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          location: C:\
+          install: >-
+            mingw-w64-ucrt-x86_64-clang mingw-w64-ucrt-x86_64-lld mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-sdl3 mingw-w64-ucrt-x86_64-opus mingw-w64-ucrt-x86_64-libvpx
+            mingw-w64-ucrt-x86_64-zstd mingw-w64-ucrt-x86_64-vulkan-devel
+            mingw-w64-ucrt-x86_64-vulkan-memory-allocator mingw-w64-ucrt-x86_64-llvm-tools
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r tools/requirements.txt
+      - run: python tools/make_fixture.py
+      - run: python tools/build_game.py --version fixture --expected generated/fixture/expected.json
+      - run: build\fixture\totk.exe --selftest
+      - run: build\fixture\totk.exe --probe-platform
+      - run: build\fixture\totk.exe --probe-preempt
+      - run: build\fixture\totk.exe --probe-cfg

@@ -1,8 +1,8 @@
-"""Build the shader translator: build/xlate/totk_xlate.exe (Ryujinx 1.3.2 + patches, NativeAOT, SPIR-V for Vulkan).
+"""Build the shader translator: build/xlate/totk_xlate[.exe] (Ryujinx 1.3.2 + patches, NativeAOT, SPIR-V for Vulkan).
 
 Copies tools/vendor/ryujinx to build/xlate/ryujinx, applies tools/xlate/patches/*.patch there (tools/vendor stays
-byte-identical; 0001-0004 are MNG's, 0005-0009 are ours), then runs `dotnet publish`. Needs the .NET 10 SDK, the MSVC build
-tools and vswhere.exe (docs/building.md). Run with .venv.
+byte-identical; 0001-0004 are MNG's, 0005-0009 are ours), then runs `dotnet publish`. Needs the .NET 10 SDK and, on Windows, the MSVC
+build tools and vswhere.exe; on Linux clang and zlib (docs/building.md). Run with .venv.
 
 Next to the exe it writes totk_xlate.id: the translator identity, a sha256 over everything the build reads (this script,
 Program.cs, the csproj, the patches, the vendor tree). runtime/gfx_shader.c puts it into every shader cache key, so a
@@ -28,6 +28,8 @@ VENDOR = ROOT / "tools" / "vendor" / "ryujinx"
 MNG_VENDOR = ROOT / "refs" / "MacNativeGames" / "vendor" / "ryujinx"
 XLATE = ROOT / "tools" / "xlate"
 BUILD = ROOT / "build" / "xlate"
+WINDOWS = sys.platform == "win32"
+EXE = "totk_xlate.exe" if WINDOWS else "totk_xlate"
 VSWHERE_DIR = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio" / "Installer"
 
 
@@ -138,16 +140,17 @@ def main() -> None:
         global BUILD
         BUILD = a.out.resolve()
     if a.id_only:
-        write_identity(BUILD / "totk_xlate.exe")
+        write_identity(BUILD / EXE)
         return
     started = time.time()
     dotnet = shutil.which("dotnet")
     if not dotnet:
         sys.exit("missing: dotnet (.NET 10 SDK)")
-    if not (VSWHERE_DIR / "vswhere.exe").is_file() and not shutil.which("vswhere"):
-        sys.exit(f"missing: vswhere.exe (expected in {VSWHERE_DIR}); NativeAOT cannot link without it")
     env = dict(os.environ)
-    env["PATH"] = str(VSWHERE_DIR) + os.pathsep + env["PATH"]
+    if WINDOWS:
+        if not (VSWHERE_DIR / "vswhere.exe").is_file() and not shutil.which("vswhere"):
+            sys.exit(f"missing: vswhere.exe (expected in {VSWHERE_DIR}); NativeAOT cannot link without it")
+        env["PATH"] = str(VSWHERE_DIR) + os.pathsep + env["PATH"]
 
     verify_vendor()
     src = prepare_sources()
@@ -159,13 +162,13 @@ def main() -> None:
     out = BUILD / "publish"
     shutil.rmtree(out, ignore_errors=True)
     cmd = [
-        dotnet, "publish", str(work / "totk_xlate.csproj"), "-c", "Release", "-r", "win-x64",
+        dotnet, "publish", str(work / "totk_xlate.csproj"), "-c", "Release", "-r", "win-x64" if WINDOWS else "linux-x64",
         "-p:PublishAot=true", "-p:InvariantGlobalization=true", f"-p:RyuSrc={src}", "-o", str(out),
     ]
     if subprocess.run(cmd, env=env).returncode != 0:
         sys.exit("dotnet publish failed")
-    exe = BUILD / "totk_xlate.exe"
-    shutil.copy2(out / "totk_xlate.exe", exe)
+    exe = BUILD / EXE
+    shutil.copy2(out / EXE, exe)
     write_identity(exe)
     print(f"built {exe} ({exe.stat().st_size / 1e6:.1f} MB) in {time.time() - started:.0f} s")
 

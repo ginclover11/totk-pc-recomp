@@ -6,7 +6,7 @@
 // which is the controller the game reads in that mode. Mouse and keyboard report no input. The controller has two
 // vibration devices (left, right) played on the gamepad's motors (TOTK_RUMBLE=0: none) and a six-axis sensor fed by
 // the gamepad's gyro and accelerometer (TOTK_MOTION=0, live: reads at rest). State layouts follow libnx HID.
-#include <windows.h>
+#include "platform/platform.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -26,7 +26,7 @@ _Static_assert(sizeof(ControllerSupportResult) == 8, "controller support result 
 
 enum { STYLE_FULL_KEY = 1, STYLE_HANDHELD = 2, ATTR_CONNECTED = 1 };
 
-static SRWLOCK lock = SRWLOCK_INIT;
+static PlatMutex lock = PLAT_MUTEX_INIT;
 static uint32_t styles = STYLE_FULL_KEY;
 static int enabled, allowed = 1, mouse_ready, keyboard_ready;
 static int64_t sample;
@@ -43,9 +43,9 @@ static const uint32_t *need_id(Cpu *c, int i, const char *fn) {
 // void InitializeNpad()
 static void ov_initialize_npad(Cpu *c) {
     (void)c;
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     enabled = 1;
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
     rt_log("hid: controllers initialized (one connected %s controller)",
            ov_handheld() ? "handheld" : "full-key");
 }
@@ -57,24 +57,24 @@ static void ov_supported_ids(Cpu *c) {
     if (n > 10 || (!ids && n)) rt_fatal("nn::hid::SetSupportedNpadIdType: invalid id list (%llu ids)", (unsigned long long)n);
     int ok = 0;
     for (uint64_t i = 0; i < n; i++) ok |= ids[i] == pad_id();
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     allowed = ok;
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
 }
 
 // void SetSupportedNpadStyleSet(NpadStyleSet styles)
 static void ov_supported_styles(Cpu *c) {
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     styles = (uint32_t)arg_x(c, 0);
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
 }
 
 // NpadStyleSet GetNpadStyleSet(const NpadIdType &id)
 static void ov_style_set(Cpu *c) {
     uint32_t id = *need_id(c, 0, "GetNpadStyleSet");
-    AcquireSRWLockShared(&lock);
+    plat_mutex_lock_shared(&lock);
     uint32_t v = enabled && allowed && id == pad_id() ? styles & pad_style() : 0;
-    ReleaseSRWLockShared(&lock);
+    plat_mutex_unlock_shared(&lock);
     ret_x(c, v);
 }
 
@@ -86,10 +86,10 @@ static void npad_states(Cpu *c, uint32_t want) {
     uint32_t id = *need_id(c, 2, "GetNpadStates");
     if (max <= 0) { ret_x(c, 0); return; }
     if (!out) rt_fatal("nn::hid::GetNpadStates: null output");
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     NpadState s = {.sampling = ++sample};
     int live = want && enabled && allowed && id == pad_id() && want == pad_style() && (styles & want);
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
     if (live) {
         s.attributes = ATTR_CONNECTED;
         input_poll(&s.buttons, &s.lx, &s.ly, &s.rx, &s.ry);
@@ -111,9 +111,9 @@ static void ov_hold_type(Cpu *c) {
 static void ov_disconnect(Cpu *c) {
     uint32_t id = *need_id(c, 0, "DisconnectNpad");
     if (id != pad_id()) return;
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     allowed = 0;
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
 }
 
 // Result ShowControllerSupport(ControllerSupportResultInfo *out, const ControllerSupportArg &arg): the one controller
@@ -126,16 +126,16 @@ static void ov_controller_support(Cpu *c) {
 
 static void ov_initialize_mouse(Cpu *c) {
     (void)c;
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     mouse_ready = 1;
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
 }
 
 static void ov_initialize_keyboard(Cpu *c) {
     (void)c;
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     keyboard_ready = 1;
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
 }
 
 // int GetMouseStates(MouseState *out, int count): a mouse that is not connected
@@ -144,10 +144,10 @@ static void ov_mouse_states(Cpu *c) {
     int max = (int)arg_x(c, 1);
     if (max <= 0) { ret_x(c, 0); return; }
     if (!out) rt_fatal("nn::hid::GetMouseStates: null output");
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     if (!mouse_ready) rt_fatal("nn::hid::GetMouseStates before InitializeMouse");
     *out = (MouseState){.sampling = ++sample};
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
     ret_x(c, 1);
 }
 
@@ -155,10 +155,10 @@ static void ov_mouse_states(Cpu *c) {
 static void ov_keyboard_state(Cpu *c) {
     KeyboardState *out = arg_p(c, 0);
     if (!out) rt_fatal("nn::hid::GetKeyboardState: null output");
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     if (!keyboard_ready) rt_fatal("nn::hid::GetKeyboardState before InitializeKeyboard");
     *out = (KeyboardState){.sampling = ++sample};
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
 }
 
 // ---- vibration and six-axis sensor (MacNativeGames hid_feedback.c)
@@ -183,7 +183,7 @@ static int env_zero(const char *name) {
 }
 
 static void once(volatile long *flag, const char *fmt, uint32_t v) {
-    if (!InterlockedExchange(flag, 1)) rt_log(fmt, v);
+    if (!__atomic_exchange_n(flag, 1, __ATOMIC_SEQ_CST)) rt_log(fmt, v);
 }
 
 // TOTK_RUMBLE_STRENGTH (percent, 0..300, default 130; 0 = off) and TOTK_RUMBLE_CURVE (exponent on the amplitude, 0.2..1.5,
@@ -204,7 +204,7 @@ static void rumble_cfg(void) {
     rumble_strength = cfg_float("TOTK_RUMBLE_STRENGTH", 0, 300) / 100;
     rumble_curve = cfg_float("TOTK_RUMBLE_CURVE", 0.2f, 1.5f);
     int trig = input_rumble_triggers_enabled();
-    if (!InterlockedExchange(&rumble_cfg_logged, 1))
+    if (!__atomic_exchange_n(&rumble_cfg_logged, 1, __ATOMIC_SEQ_CST))
         rt_log("hid: rumble strength %.0f%%, curve %.2f, triggers %s", rumble_strength * 100, rumble_curve, trig ? "on" : "off");
 }
 static uint16_t motor(float a) { return rumble_motor(a, rumble_curve, rumble_strength); }
@@ -284,7 +284,7 @@ static int vibration_side(const uint32_t *h, const char *fn) {
     return -1;
 }
 
-static SRWLOCK vib_lock = SRWLOCK_INIT;
+static PlatMutex vib_lock = PLAT_MUTEX_INIT;
 static VibrationValue vib_last[2] = {{0, 160, 0, 320}, {0, 160, 0, 320}};   // vib_lock
 static uint64_t vib_at[2], sent_at;                                          // vib_lock
 static uint16_t sent_low, sent_high;                                         // vib_lock
@@ -324,18 +324,18 @@ static void play(int side, const VibrationValue *v) {
     VibrationValue c = *v;
     if (!isfinite(c.amp_low) || !isfinite(c.amp_high) || !isfinite(c.freq_low) || !isfinite(c.freq_high)) c = vib_neutral;
     static volatile long first, first_on;
-    if (!InterlockedExchange(&first, 1))
+    if (!__atomic_exchange_n(&first, 1, __ATOMIC_SEQ_CST))
         rt_log("hid: first vibration value from the game: %s %.2f@%.0f Hz %.2f@%.0f Hz", side ? "right" : "left",
                (double)c.amp_low, (double)c.freq_low, (double)c.amp_high, (double)c.freq_high);
-    if ((c.amp_low > 0.01f || c.amp_high > 0.01f) && !InterlockedExchange(&first_on, 1))
+    if ((c.amp_low > 0.01f || c.amp_high > 0.01f) && !__atomic_exchange_n(&first_on, 1, __ATOMIC_SEQ_CST))
         rt_log("hid: first non-zero vibration from the game: %s %.2f@%.0f Hz %.2f@%.0f Hz", side ? "right" : "left",
                (double)c.amp_low, (double)c.freq_low, (double)c.amp_high, (double)c.freq_high);
     uint64_t now = kern_now_ns();
-    AcquireSRWLockExclusive(&vib_lock);
+    plat_mutex_lock(&vib_lock);
     vib_last[side] = c;
     vib_at[side] = now;
     rumble_update(now);
-    ReleaseSRWLockExclusive(&vib_lock);
+    plat_mutex_unlock(&vib_lock);
 }
 
 // Result detail::InitializeVibrationDevice(const VibrationDeviceHandle &)
@@ -369,9 +369,9 @@ static void ov_vib_actual(Cpu *c) {
     if (!out) rt_fatal("nn::hid::detail::GetActualVibrationValue: null output");
     int side = vibration_side(arg_p(c, 1), "GetActualVibrationValue");
     VibrationValue v = vib_neutral;
-    AcquireSRWLockShared(&vib_lock);
+    plat_mutex_lock_shared(&vib_lock);
     if (side >= 0) v = vib_last[side];
-    ReleaseSRWLockShared(&vib_lock);
+    plat_mutex_unlock_shared(&vib_lock);
     *out = v;
     ret_x(c, 0);
 }
@@ -397,19 +397,19 @@ static void ov_vib_mounted(Cpu *c) {
 static void ov_vib_permitted(Cpu *c) {
     uint8_t *out = arg_p(c, 0);
     if (!out) rt_fatal("nn::hid::detail::IsVibrationPermitted: null output");
-    AcquireSRWLockShared(&vib_lock);
+    plat_mutex_lock_shared(&vib_lock);
     *out = (uint8_t)vib_allowed;
-    ReleaseSRWLockShared(&vib_lock);
+    plat_mutex_unlock_shared(&vib_lock);
     ret_x(c, 0);
 }
 
 // Result detail::PermitVibration(bool): off silences the gamepad at once
 static void ov_vib_permit(Cpu *c) {
     int on = (arg_x(c, 0) & 0xff) != 0;
-    AcquireSRWLockExclusive(&vib_lock);
+    plat_mutex_lock(&vib_lock);
     vib_allowed = on;
     rumble_update(kern_now_ns());
-    ReleaseSRWLockExclusive(&vib_lock);
+    plat_mutex_unlock(&vib_lock);
     ret_x(c, 0);
 }
 
@@ -431,14 +431,14 @@ static void ov_six_start(Cpu *c) {
         once(&logged, "hid: the game started the six-axis sensor (handle %#x)", *h);
         motion_restart(motion_global());
         input_motion_start();
-        InterlockedExchange(&six_running, 1);
+        __atomic_exchange_n(&six_running, 1, __ATOMIC_SEQ_CST);
     }
     ret_x(c, 0);
 }
 
 // Result detail::StopSixAxisSensor(const SixAxisSensorHandle &)
 static void ov_six_stop(Cpu *c) {
-    if (six_axis_ours(arg_p(c, 0), "StopSixAxisSensor")) InterlockedExchange(&six_running, 0);
+    if (six_axis_ours(arg_p(c, 0), "StopSixAxisSensor")) __atomic_exchange_n(&six_running, 0, __ATOMIC_SEQ_CST);
     ret_x(c, 0);
 }
 

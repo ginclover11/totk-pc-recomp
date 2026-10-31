@@ -2,8 +2,12 @@
 // SRW locks and condition variables.
 #include <stdio.h>
 #include <windows.h>
+#include <bcrypt.h>
+#include <time.h>
+#include <timeapi.h>
 #include <pdh.h>
 #include <pdhmsg.h>
+#include <io.h>
 #include <psapi.h>
 #include <shellapi.h>
 #include <stdlib.h>
@@ -31,11 +35,15 @@ static DWORD WINAPI thread_main(LPVOID p) {
 }
 
 PlatThread *plat_thread_new(PlatThreadFn fn, void *arg, const char *name) {
+    return plat_thread_new_stack(fn, arg, name, 0);
+}
+
+PlatThread *plat_thread_new_stack(PlatThreadFn fn, void *arg, const char *name, size_t stack_bytes) {
     PlatThread *t = calloc(1, sizeof *t);
     if (!t) return NULL;
     t->fn = fn;
     t->arg = arg;
-    t->h = CreateThread(NULL, 0, thread_main, t, CREATE_SUSPENDED, NULL);
+    t->h = CreateThread(NULL, stack_bytes, thread_main, t, CREATE_SUSPENDED | STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (!t->h) { free(t); return NULL; }
     if (name) {
         wchar_t w[64];
@@ -65,6 +73,68 @@ uint32_t plat_cpu_count(void) {
     DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
     return n ? (uint32_t)n : 1;
 }
+
+void plat_thread_name(const char *name) {
+    wchar_t w[64];
+    if (MultiByteToWideChar(CP_UTF8, 0, name, -1, w, 64)) SetThreadDescription(GetCurrentThread(), w);
+}
+
+void plat_thread_priority(PlatThread *t, int level) { SetThreadPriority(t ? t->h : GetCurrentThread(), level); }
+
+uint64_t plat_thread_cpu_ns(uint32_t tid) {
+    HANDLE th = tid ? OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid) : NULL;
+    FILETIME a, b, k, u;
+    uint64_t ns = 0;
+    if (th && GetThreadTimes(th, &a, &b, &k, &u))
+        ns = (((uint64_t)k.dwHighDateTime << 32 | k.dwLowDateTime) + ((uint64_t)u.dwHighDateTime << 32 | u.dwLowDateTime)) * 100;
+    if (th) CloseHandle(th);
+    return ns;
+}
+
+static PlatInterruptFn g_interrupt;
+
+void plat_interrupt_init(PlatInterruptFn fn) { g_interrupt = fn; }
+
+PlatThreadRef *plat_thread_ref_self(void) {
+    return (PlatThreadRef *)OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION,
+                                       FALSE, GetCurrentThreadId());
+}
+
+void plat_thread_ref_close(PlatThreadRef *r) { if (r) CloseHandle((HANDLE)r); }
+
+int plat_thread_interrupt(PlatThreadRef *r, void *arg) {
+    HANDLE h = (HANDLE)r;
+    if (SuspendThread(h) == (DWORD)-1) return PLAT_INT_FAILED;
+    CONTEXT ctx;
+    memset(&ctx, 0, sizeof ctx);
+    ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;   // set back whole, so the kernel restores every GPR
+    int res = PLAT_INT_FAILED;
+    if (GetThreadContext(h, &ctx)) {
+        uint64_t to = g_interrupt(ctx.Rip, arg);
+        res = PLAT_INT_LEFT;
+        if (to) {
+            ctx.Rip = to;
+            res = SetThreadContext(h, &ctx) ? PLAT_INT_REDIRECTED : PLAT_INT_FAILED;
+        }
+    }
+    ResumeThread(h);
+    return res;
+}
+
+PlatFiber *plat_fiber_convert(void) { return (PlatFiber *)ConvertThreadToFiberEx(NULL, FIBER_FLAG_FLOAT_SWITCH); }
+void plat_fiber_unconvert(void) { ConvertFiberToThread(); }
+
+PlatFiber *plat_fiber_new(size_t stack_bytes, void (*fn)(void *arg), void *arg) {
+    return (PlatFiber *)CreateFiberEx(0x10000, stack_bytes, FIBER_FLAG_FLOAT_SWITCH, (LPFIBER_START_ROUTINE)(void *)fn, arg);
+}
+
+void plat_fiber_switch(PlatFiber *to) { SwitchToFiber(to); }
+void plat_fiber_delete(PlatFiber *f) { DeleteFiber(f); }
+
+int plat_thread_priority_get(void) { return GetThreadPriority(GetCurrentThread()); }
+int plat_thread_wait_ms(PlatThread *t, uint32_t ms) { return WaitForSingleObject(t->h, ms) != WAIT_TIMEOUT; }
+
+void plat_yield(void) { SwitchToThread(); }
 
 // ---- time
 
@@ -114,12 +184,36 @@ void plat_sleep_ns(uint64_t ns) {
     while (plat_now_ns() < end) SwitchToThread();
 }
 
+void plat_wait_ns(uint64_t ns) {
+    if (!sleep_timer_tried) {
+        sleep_timer_tried = 1;
+        sleep_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    }
+    LARGE_INTEGER due = {.QuadPart = -(LONGLONG)(ns / 100 + 1)};   // relative, 100 ns units, rounded up
+    if (sleep_timer && SetWaitableTimerEx(sleep_timer, &due, 0, NULL, NULL, NULL, 0)) WaitForSingleObject(sleep_timer, INFINITE);
+    else Sleep((DWORD)(ns / 1000000));
+}
+
+void plat_sleep_ms(uint32_t ms) { Sleep(ms); }
+uint64_t plat_counter(void) {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return (uint64_t)t.QuadPart;
+}
+uint64_t plat_counter_hz(void) { return qpc_freq(); }
+void plat_timer_fine(void) { timeBeginPeriod(1); }
+uint64_t plat_tick_ms(void) { return GetTickCount64(); }
+
 // ---- locks and condition variables
 
 void plat_mutex_init(PlatMutex *m) { InitializeSRWLock((PSRWLOCK)m); }
 void plat_mutex_lock(PlatMutex *m) { AcquireSRWLockExclusive((PSRWLOCK)m); }
 int plat_mutex_trylock(PlatMutex *m) { return TryAcquireSRWLockExclusive((PSRWLOCK)m) != 0; }
 void plat_mutex_unlock(PlatMutex *m) { ReleaseSRWLockExclusive((PSRWLOCK)m); }
+
+void plat_mutex_lock_shared(PlatMutex *m) { AcquireSRWLockShared((PSRWLOCK)m); }
+int plat_mutex_trylock_shared(PlatMutex *m) { return TryAcquireSRWLockShared((PSRWLOCK)m) != 0; }
+void plat_mutex_unlock_shared(PlatMutex *m) { ReleaseSRWLockShared((PSRWLOCK)m); }
 
 void plat_cond_init(PlatCond *c) { InitializeConditionVariable((PCONDITION_VARIABLE)c); }
 void plat_cond_wait(PlatCond *c, PlatMutex *m) { SleepConditionVariableSRW((PCONDITION_VARIABLE)c, (PSRWLOCK)m, INFINITE, 0); }
@@ -132,6 +226,25 @@ int plat_cond_wait_ns(PlatCond *c, PlatMutex *m, uint64_t ns) {
 
 void plat_cond_signal(PlatCond *c) { WakeConditionVariable((PCONDITION_VARIABLE)c); }
 void plat_cond_broadcast(PlatCond *c) { WakeAllConditionVariable((PCONDITION_VARIABLE)c); }
+
+_Static_assert(sizeof(PlatOnce) == sizeof(INIT_ONCE), "PlatOnce holds an INIT_ONCE");
+
+static BOOL CALLBACK once_call(INIT_ONCE *o, void *fn, void **ctx) {
+    (void)o, (void)ctx;
+    ((void (*)(void))fn)();
+    return TRUE;
+}
+
+void plat_once(PlatOnce *o, void (*fn)(void)) { InitOnceExecuteOnce((INIT_ONCE *)o, once_call, (void *)fn, NULL); }
+
+PlatEvent *plat_event_new(int manual, int initially_set) {
+    return (PlatEvent *)CreateEventW(NULL, manual, initially_set, NULL);
+}
+void plat_event_free(PlatEvent *e) { if (e) CloseHandle((HANDLE)e); }
+void plat_event_set(PlatEvent *e) { SetEvent((HANDLE)e); }
+void plat_event_reset(PlatEvent *e) { ResetEvent((HANDLE)e); }
+void plat_event_wait(PlatEvent *e) { WaitForSingleObject((HANDLE)e, INFINITE); }
+int plat_event_wait_ms(PlatEvent *e, uint32_t ms) { return WaitForSingleObject((HANDLE)e, ms) == WAIT_OBJECT_0; }
 
 // ---- files
 
@@ -245,9 +358,9 @@ int plat_file_flush(const char *path) {
     return ok;
 }
 
-void plat_file_delete(const char *path) {
+int plat_file_delete(const char *path) {
     wchar_t w[WPATH];
-    if (widen(path, w, WPATH)) DeleteFileW(w);
+    return widen(path, w, WPATH) && DeleteFileW(w);
 }
 
 int plat_file_truncate(const char *path, uint64_t size) {
@@ -292,8 +405,513 @@ int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name,
     return 1;
 }
 
+FILE *plat_fopen(const char *path, const char *mode) {
+    wchar_t w[WPATH], m[16];
+    if (!widen(path, w, WPATH) || !widen(mode, m, 16)) return NULL;
+    return _wfopen(w, m);
+}
+
+int plat_file_sync_stream(FILE *f) { return !_commit(_fileno(f)); }
+int plat_fseek(FILE *f, int64_t at, int whence) { return _fseeki64(f, at, whence); }
+int64_t plat_ftell(FILE *f) { return _ftelli64(f); }
+
+PlatFile *plat_file_open(const char *path, int flags) {
+    wchar_t w[WPATH];
+    if (!widen(path, w, WPATH)) return NULL;
+    DWORD access = (flags & PLAT_FILE_READ ? GENERIC_READ : 0) | (flags & PLAT_FILE_WRITE ? GENERIC_WRITE : 0);
+    DWORD attrs = (flags & PLAT_FILE_UNBUFFERED ? FILE_FLAG_NO_BUFFERING : FILE_ATTRIBUTE_NORMAL) |
+                  (flags & PLAT_FILE_PARALLEL ? FILE_FLAG_OVERLAPPED : 0);
+    DWORD create = flags & PLAT_FILE_EXCL ? CREATE_NEW : flags & PLAT_FILE_TRUNC ? (flags & PLAT_FILE_CREATE ? CREATE_ALWAYS : TRUNCATE_EXISTING)
+                                           : flags & PLAT_FILE_CREATE ? OPEN_ALWAYS : OPEN_EXISTING;
+    HANDLE h = CreateFileW(w, access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, create, attrs, NULL);
+    return h == INVALID_HANDLE_VALUE ? NULL : (PlatFile *)h;
+}
+
+void plat_file_close(PlatFile *f) { if (f) CloseHandle((HANDLE)f); }
+
+// Works on synchronous and FILE_FLAG_OVERLAPPED handles; the event is per thread, so concurrent reads on one handle do
+// not share it.
+int64_t plat_file_pread(PlatFile *f, void *buf, uint64_t n, uint64_t at) {
+    static _Thread_local HANDLE ev;
+    if (!ev && !(ev = CreateEventW(NULL, TRUE, FALSE, NULL))) return -1;
+    uint64_t done = 0;
+    while (done < n) {
+        uint64_t off = at + done;
+        OVERLAPPED o = {.Offset = (DWORD)off, .OffsetHigh = (DWORD)(off >> 32), .hEvent = ev};
+        DWORD want = n - done > 0x40000000u ? 0x40000000u : (DWORD)(n - done), got = 0;
+        if (!ReadFile((HANDLE)f, (char *)buf + done, want, &got, &o)) {
+            DWORD e = GetLastError();
+            if (e == ERROR_IO_PENDING && !GetOverlappedResult((HANDLE)f, &o, &got, TRUE)) e = GetLastError();
+            else if (e == ERROR_IO_PENDING) e = 0;
+            if (e == ERROR_HANDLE_EOF) break;
+            if (e) {
+                SetLastError(e);
+                return -1;
+            }
+        }
+        if (!got) break;
+        done += got;
+    }
+    return (int64_t)done;
+}
+
+int64_t plat_file_pwrite(PlatFile *f, const void *buf, uint64_t n, uint64_t at) {
+    uint64_t done = 0;
+    while (done < n) {
+        uint64_t off = at + done;
+        OVERLAPPED o = {.Offset = (DWORD)off, .OffsetHigh = (DWORD)(off >> 32)};
+        DWORD want = n - done > 0x40000000u ? 0x40000000u : (DWORD)(n - done), put = 0;
+        if (!WriteFile((HANDLE)f, (const char *)buf + done, want, &put, &o) || !put) return -1;
+        done += put;
+    }
+    return (int64_t)done;
+}
+
+int64_t plat_file_handle_size(PlatFile *f) {
+    LARGE_INTEGER sz;
+    return GetFileSizeEx((HANDLE)f, &sz) ? (int64_t)sz.QuadPart : -1;
+}
+
+int plat_file_set_size(PlatFile *f, uint64_t n) {
+    FILE_END_OF_FILE_INFO eof = {.EndOfFile.QuadPart = (LONGLONG)n};
+    return SetFileInformationByHandle((HANDLE)f, FileEndOfFileInfo, &eof, sizeof eof) != 0;
+}
+
+int plat_file_sync(PlatFile *f) { return FlushFileBuffers((HANDLE)f) != 0; }
+
+int plat_file_identity(PlatFile *f, PlatFileId *id) {
+    BY_HANDLE_FILE_INFORMATION i;
+    if (!GetFileInformationByHandle((HANDLE)f, &i)) return 0;
+    *id = (PlatFileId){i.dwVolumeSerialNumber, 0, (uint64_t)i.nFileIndexHigh << 32 | i.nFileIndexLow,
+                       (uint64_t)i.nFileSizeHigh << 32 | i.nFileSizeLow,
+                       (uint64_t)i.ftLastWriteTime.dwHighDateTime << 32 | i.ftLastWriteTime.dwLowDateTime,
+                       (uint64_t)i.ftCreationTime.dwHighDateTime << 32 | i.ftCreationTime.dwLowDateTime};
+    return 1;
+}
+
+const void *plat_file_map(PlatFile *f) {
+    HANDLE map = CreateFileMappingW((HANDLE)f, NULL, PAGE_READONLY, 0, 0, NULL);
+    const void *v = map ? MapViewOfFile(map, FILE_MAP_READ, 0, 0, 0) : NULL;
+    if (map) CloseHandle(map);   // the view keeps the mapping alive
+    return v;
+}
+
+int plat_file_links(const char *path) {
+    wchar_t w[WPATH];
+    if (!widen(path, w, WPATH)) return 0;
+    HANDLE f = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    BY_HANDLE_FILE_INFORMATION fi;
+    int links = f != INVALID_HANDLE_VALUE && GetFileInformationByHandle(f, &fi) ? (int)fi.nNumberOfLinks : 0;
+    if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    return links;
+}
+
+int plat_dir_exists(const char *path) {
+    wchar_t w[WPATH];
+    if (!widen(path, w, WPATH)) return 0;
+    DWORD a = GetFileAttributesW(w);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+int plat_dir_remove(const char *path) {
+    wchar_t w[WPATH];
+    return widen(path, w, WPATH) && RemoveDirectoryW(w);
+}
+
+int plat_file_move(const char *from, const char *to) {
+    wchar_t a[WPATH], b[WPATH];
+    return widen(from, a, WPATH) && widen(to, b, WPATH) && MoveFileExW(a, b, 0);
+}
+
+int plat_file_move_durable(const char *from, const char *to) {
+    wchar_t a[WPATH], b[WPATH];
+    return widen(from, a, WPATH) && widen(to, b, WPATH) && MoveFileExW(a, b, MOVEFILE_WRITE_THROUGH);
+}
+
+int plat_file_link(const char *existing, const char *link) {
+    wchar_t a[WPATH], b[WPATH];
+    return widen(existing, a, WPATH) && widen(link, b, WPATH) && CreateHardLinkW(b, a, NULL);
+}
+
+int plat_dir_sync(const char *path) {
+    wchar_t w[WPATH];
+    if (!widen(path, w, WPATH)) return 0;
+    HANDLE h = CreateFileW(w, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                           FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    int ok = FlushFileBuffers(h) != 0;
+    CloseHandle(h);
+    return ok;
+}
+
+int plat_path_info(const char *path) {
+    wchar_t w[WPATH];
+    if (!widen(path, w, WPATH)) return 0;
+    DWORD a = GetFileAttributesW(w);
+    if (a == INVALID_FILE_ATTRIBUTES) return 0;
+    return PLAT_PATH_EXISTS | (a & FILE_ATTRIBUTE_DIRECTORY ? PLAT_PATH_DIR : 0) |
+           (a & FILE_ATTRIBUTE_REPARSE_POINT ? PLAT_PATH_LINK : 0) | (a & FILE_ATTRIBUTE_READONLY ? PLAT_PATH_READONLY : 0);
+}
+
+int plat_error_kind(uint32_t error) {
+    switch (error) {
+    case ERROR_FILE_NOT_FOUND: case ERROR_PATH_NOT_FOUND: case ERROR_DIRECTORY: return PLAT_ERR_NOT_FOUND;
+    case ERROR_FILE_EXISTS: case ERROR_ALREADY_EXISTS: return PLAT_ERR_EXISTS;
+    case ERROR_DIR_NOT_EMPTY: return PLAT_ERR_NOT_EMPTY;
+    case ERROR_ACCESS_DENIED: case ERROR_SHARING_VIOLATION: return PLAT_ERR_BUSY;
+    case ERROR_NOACCESS: return PLAT_ERR_BAD_BUFFER;
+    default: return PLAT_ERR_OTHER;
+    }
+}
+
+int plat_dir_make(const char *path) {
+    wchar_t w[WPATH];
+    return widen(path, w, WPATH) && (CreateDirectoryW(w, NULL) || GetLastError() == ERROR_ALREADY_EXISTS);
+}
+
+int plat_dir_create(const char *path) {
+    wchar_t w[WPATH];
+    return widen(path, w, WPATH) && CreateDirectoryW(w, NULL);
+}
+
+struct PlatDir {
+    HANDLE h;
+    WIN32_FIND_DATAW fd;
+    int have;
+    char name[1024];
+};
+
+PlatDir *plat_dir_open(const char *dir) {
+    wchar_t wd[WPATH], pat[WPATH + 8];
+    if (!widen(dir, wd, WPATH)) return NULL;
+    swprintf(pat, WPATH + 8, L"%ls\\*", wd);
+    PlatDir *d = malloc(sizeof *d);
+    if (!d) return NULL;
+    d->h = FindFirstFileW(pat, &d->fd);
+    if (d->h == INVALID_HANDLE_VALUE) {
+        DWORD e = GetLastError();
+        free(d);
+        SetLastError(e);
+        return NULL;
+    }
+    d->have = 1;
+    return d;
+}
+
+int plat_dir_next(PlatDir *d, PlatDirEntry *e) {
+    for (;;) {
+        if (!d->have && !FindNextFileW(d->h, &d->fd)) return 0;
+        d->have = 0;
+        const WIN32_FIND_DATAW *f = &d->fd;
+        if (!wcscmp(f->cFileName, L".") || !wcscmp(f->cFileName, L"..")) continue;
+        if (!WideCharToMultiByte(CP_UTF8, 0, f->cFileName, -1, d->name, sizeof d->name, NULL, NULL)) continue;
+        e->name = d->name;
+        e->is_dir = (f->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        e->is_link = (f->dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        e->size = (uint64_t)f->nFileSizeHigh << 32 | f->nFileSizeLow;
+        return 1;
+    }
+}
+
+void plat_dir_close(PlatDir *d) {
+    if (!d) return;
+    FindClose(d->h);
+    free(d);
+}
+
+// ---- memory
+
+int plat_mem_reserve(uint64_t addr, size_t n, int watch) {
+    void *want = (void *)(uintptr_t)addr;
+    void *p = VirtualAlloc(want, n, MEM_RESERVE | (watch ? MEM_WRITE_WATCH : 0), PAGE_NOACCESS);
+    if (p && p != want) {
+        VirtualFree(p, 0, MEM_RELEASE);
+        p = NULL;
+    }
+    return p != NULL;
+}
+
+void plat_mem_release(uint64_t addr, size_t n) { (void)n; VirtualFree((void *)(uintptr_t)addr, 0, MEM_RELEASE); }
+
 int plat_mem_commit(uint64_t addr, size_t n) {
     return VirtualAlloc((void *)(uintptr_t)addr, n, MEM_COMMIT, PAGE_READWRITE) != NULL;
+}
+
+int plat_mem_decommit(uint64_t addr, size_t n) { return VirtualFree((void *)(uintptr_t)addr, n, MEM_DECOMMIT) != 0; }
+
+int plat_mem_protect(uint64_t addr, size_t n, int prot) {
+    static const DWORD win[] = {PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE};
+    DWORD old;
+    return VirtualProtect((void *)(uintptr_t)addr, n, win[prot], &old) != 0;
+}
+
+// Adapted from LAS Recomp runtime/platform/windows.c:40-63 @ da35b83 (MIT, Copyright (c) 2026 Peiikai): GetWriteWatch
+// with the reset flag.
+uint64_t plat_mem_written(uint64_t addr, size_t n, uint64_t *pages, uint64_t max, int reset) {
+    ULONG_PTR count = (ULONG_PTR)max;
+    DWORD gran;
+    _Static_assert(sizeof(PVOID) == sizeof(uint64_t), "page addresses are written straight into a uint64_t array");
+    if (GetWriteWatch(reset ? WRITE_WATCH_FLAG_RESET : 0, (void *)(uintptr_t)addr, (SIZE_T)n, (PVOID *)pages, &count, &gran))
+        return UINT64_MAX;
+    return count;
+}
+
+// Reserved holes (heap pages given back) stay as they are, and plat_mem_thaw finds the read-only runs again.
+int plat_mem_can_freeze(void) { return 1; }
+
+int plat_mem_freeze(uint64_t addr, size_t size) {
+    uint64_t a = addr, end = a + size, run[16][2];
+    int n = 0;
+    MEMORY_BASIC_INFORMATION mbi;
+    for (uint64_t x = a; x < end; ) {
+        if (!VirtualQuery((void *)(uintptr_t)x, &mbi, sizeof mbi)) return 0;
+        uint64_t y = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (y > end) y = end;
+        if (mbi.State == MEM_COMMIT) {
+            if (mbi.Protect != PAGE_READWRITE || n == 16) return 0;
+            run[n][0] = x, run[n][1] = y, n++;
+        } else if (mbi.State != MEM_RESERVE) return 0;
+        x = y;
+    }
+    DWORD old;
+    for (int i = 0; i < n; i++)
+        if (!VirtualProtect((void *)(uintptr_t)run[i][0], run[i][1] - run[i][0], PAGE_READONLY, &old)) {
+            while (i--) VirtualProtect((void *)(uintptr_t)run[i][0], run[i][1] - run[i][0], PAGE_READWRITE, &old);
+            return 0;
+        }
+    return n > 0;
+}
+
+int plat_mem_thaw(uint64_t addr, size_t size) {
+    uint64_t a = addr, end = a + size;
+    DWORD old;
+    if (VirtualProtect((void *)(uintptr_t)a, size, PAGE_READWRITE, &old)) return 1;
+    // Not all committed (the freeze left reserved holes): the read-only runs only. Every committed page of a frozen
+    // region was read-write at the freeze, and mapping changes thaw before they run, so these are all ours.
+    MEMORY_BASIC_INFORMATION mbi;
+    while (a < end && VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi)) {
+        uint64_t b = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (b > end) b = end;
+        if (mbi.State == MEM_COMMIT && mbi.Protect == PAGE_READONLY &&
+            !VirtualProtect((void *)(uintptr_t)a, b - a, PAGE_READWRITE, &old))
+            return 0;
+        a = b;
+    }
+    return 1;
+}
+
+void *plat_mem_alloc(size_t n) { return VirtualAlloc(NULL, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE); }
+void plat_mem_free(void *p, size_t n) { (void)n; if (p) VirtualFree(p, 0, MEM_RELEASE); }
+void *plat_aligned_alloc(size_t n, size_t align) { return _aligned_malloc(n, align); }
+void plat_aligned_free(void *p) { _aligned_free(p); }
+
+// ---- faults and crashes
+
+static int (*g_write_fault)(uint64_t);
+static void (*g_crash)(const PlatCrash *);
+
+// The first handler in the chain: gives a write to an unwritable page to plat_on_write_fault's function.
+static LONG CALLBACK write_fault_veh(EXCEPTION_POINTERS *ep) {
+    const EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2 || er->ExceptionInformation[0] != 1)
+        return EXCEPTION_CONTINUE_SEARCH;
+    return g_write_fault(er->ExceptionInformation[1]) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+}
+
+void plat_on_write_fault(int (*fn)(uint64_t addr)) {
+    g_write_fault = fn;
+    AddVectoredExceptionHandler(1, write_fault_veh);
+}
+
+uint64_t plat_image_base(void) { return (uint64_t)(uintptr_t)GetModuleHandleW(NULL); }
+
+uint64_t plat_image_size(void) {
+    MODULEINFO mi;
+    return GetModuleInformation(GetCurrentProcess(), GetModuleHandleW(NULL), &mi, sizeof mi) ? mi.SizeOfImage : 0;
+}
+
+static LONG CALLBACK crash_veh(EXCEPTION_POINTERS *ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    const char *what = code == EXCEPTION_ACCESS_VIOLATION ? "access violation"
+                     : code == EXCEPTION_ILLEGAL_INSTRUCTION ? "illegal instruction"
+                     : code == EXCEPTION_INT_DIVIDE_BY_ZERO ? "integer divide by zero"
+                     : code == EXCEPTION_PRIV_INSTRUCTION ? "privileged instruction"
+                     : code == EXCEPTION_STACK_OVERFLOW ? "stack overflow"
+                     : code == EXCEPTION_IN_PAGE_ERROR ? "in-page error" : NULL;
+    if (!what) return EXCEPTION_CONTINUE_SEARCH;
+    uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
+    if (rip - (uintptr_t)plat_image_base() >= plat_image_size())
+        return EXCEPTION_CONTINUE_SEARCH;   // not our code: leave it to the handler that expects it
+    PlatCrash c = {.what = what, .rip = rip, .access = -1};
+    if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2) {
+        c.access = (int)ep->ExceptionRecord->ExceptionInformation[0];
+        c.addr = ep->ExceptionRecord->ExceptionInformation[1];
+    }
+    g_crash(&c);
+    ExitProcess(71);
+}
+
+void plat_on_crash(void (*fn)(const PlatCrash *c)) {
+    g_crash = fn;
+    AddVectoredExceptionHandler(0, crash_veh);
+}
+
+void plat_exit_now(int code) { ExitProcess((UINT)code); }
+
+void plat_rerun_self(void) {
+    STARTUPINFOW si = {.cb = sizeof si};
+    PROCESS_INFORMATION pi;
+    wchar_t *cmd = _wcsdup(GetCommandLineW());   // CreateProcessW may write its command line
+    if (!cmd || !CreateProcessW(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) return;
+    CloseHandle(pi.hThread);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 70;
+    GetExitCodeProcess(pi.hProcess, &code);
+    ExitProcess(code);
+}
+
+int plat_run_self(char *out, size_t cap, uint32_t *code) {
+    SECURITY_ATTRIBUTES sa = {sizeof sa, NULL, TRUE};
+    HANDLE rd, wr;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return 0;
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOW si = {.cb = sizeof si, .dwFlags = STARTF_USESTDHANDLES, .hStdInput = GetStdHandle(STD_INPUT_HANDLE),
+                       .hStdOutput = wr, .hStdError = wr};
+    PROCESS_INFORMATION pi;
+    wchar_t *cmd = _wcsdup(GetCommandLineW());
+    BOOL ok = CreateProcessW(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+    DWORD e = GetLastError();
+    free(cmd);
+    CloseHandle(wr);
+    if (!ok) {
+        CloseHandle(rd);
+        SetLastError(e);
+        return 0;
+    }
+    size_t n = 0;
+    DWORD got;
+    while (n + 1 < cap && ReadFile(rd, out + n, (DWORD)(cap - 1 - n), &got, NULL) && got) n += got;
+    out[n] = 0;
+    char sink[512];
+    while (ReadFile(rd, sink, sizeof sink, &got, NULL) && got) {}
+    CloseHandle(rd);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD c = 1;
+    GetExitCodeProcess(pi.hProcess, &c);
+    *code = c;
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return 1;
+}
+
+// Both places: the process's environment for child processes, and the C library's copy for getenv.
+int plat_setenv(const char *name, const char *value) {
+    return SetEnvironmentVariableA(name, value) && !_putenv_s(name, value ? value : "");
+}
+
+int plat_full_path(const char *path, char *out, size_t cap) {
+    wchar_t w[WPATH], full[WPATH];
+    if (!widen(path, w, WPATH)) return 0;
+    DWORD n = GetFullPathNameW(w, WPATH, full, NULL);
+    return n && n < WPATH && WideCharToMultiByte(CP_UTF8, 0, full, -1, out, (int)cap, NULL, NULL) != 0;
+}
+
+long plat_timezone_west(void) {
+    long west = 0;
+    _get_timezone(&west);
+    return west;
+}
+
+int plat_temp_dir(char *out, size_t cap) {
+    wchar_t w[MAX_PATH + 1];
+    DWORD n = GetTempPathW(MAX_PATH + 1, w);
+    if (!n || n > MAX_PATH) return 0;
+    if (w[n - 1] == L'\\') w[n - 1] = 0;
+    return WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)cap, NULL, NULL) != 0;
+}
+uint32_t plat_last_error(void) { return GetLastError(); }
+
+uint64_t plat_process_age_ms(void) {
+    FILETIME created, x0, x1, x2, now;
+    GetProcessTimes(GetCurrentProcess(), &created, &x0, &x1, &x2);
+    GetSystemTimeAsFileTime(&now);
+    ULARGE_INTEGER c = {.LowPart = created.dwLowDateTime, .HighPart = created.dwHighDateTime},
+                   n = {.LowPart = now.dwLowDateTime, .HighPart = now.dwHighDateTime};
+    return (n.QuadPart - c.QuadPart) / 10000;
+}
+
+const char *plat_locale_name(void) {
+    static char tag[LOCALE_NAME_MAX_LENGTH];
+    wchar_t w[LOCALE_NAME_MAX_LENGTH];
+    if (GetUserDefaultLocaleName(w, LOCALE_NAME_MAX_LENGTH)) {
+        size_t i = 0;
+        for (; w[i] && w[i] < 0x80 && i + 1 < sizeof tag; i++) tag[i] = (char)w[i];
+        tag[i] = 0;
+    }
+    return tag;
+}
+uint32_t plat_process_id(void) { return GetCurrentProcessId(); }
+
+void plat_thread_signals(void) {}
+
+int plat_random(void *out, size_t n) {
+    return !BCryptGenRandom(NULL, out, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+}
+
+struct PlatSha256 {
+    BCRYPT_HASH_HANDLE h;
+};
+
+PlatSha256 *plat_sha256_new(void) {
+    static BCRYPT_ALG_HANDLE alg;
+    BCRYPT_ALG_HANDLE a = __atomic_load_n(&alg, __ATOMIC_ACQUIRE);
+    if (!a) {
+        if (BCryptOpenAlgorithmProvider(&a, BCRYPT_SHA256_ALGORITHM, NULL, 0)) return NULL;
+        BCRYPT_ALG_HANDLE expected = NULL;
+        if (!__atomic_compare_exchange_n(&alg, &expected, a, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            BCryptCloseAlgorithmProvider(a, 0);
+            a = expected;
+        }
+    }
+    PlatSha256 *s = malloc(sizeof *s);
+    if (s && BCryptCreateHash(a, &s->h, NULL, 0, NULL, 0, 0)) { free(s); s = NULL; }
+    return s;
+}
+
+void plat_sha256_update(PlatSha256 *s, const void *p, uint64_t n) {
+    const uint8_t *b = p;
+    while (n) {
+        ULONG k = n > 0x40000000 ? 0x40000000 : (ULONG)n;
+        BCryptHashData(s->h, (PUCHAR)b, k, 0);
+        b += k;
+        n -= k;
+    }
+}
+
+void plat_sha256_finish(PlatSha256 *s, uint8_t out[32]) {
+    BCryptFinishHash(s->h, out, 32, 0);
+    BCryptDestroyHash(s->h);
+    free(s);
+}
+
+uint64_t plat_rss(void) {
+    PROCESS_MEMORY_COUNTERS pmc = {.cb = sizeof pmc};
+    return K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc) ? pmc.WorkingSetSize : 0;
+}
+
+uint64_t plat_peak_rss(void) {
+    PROCESS_MEMORY_COUNTERS pmc = {.cb = sizeof pmc};
+    return K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc) ? pmc.PeakWorkingSetSize : 0;
+}
+
+int plat_mem_is_rw(uint64_t addr) {
+    MEMORY_BASIC_INFORMATION mbi;
+    return VirtualQuery((void *)(uintptr_t)addr, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT && mbi.Protect == PAGE_READWRITE;
+}
+
+int plat_mem_is_readonly(uint64_t addr, size_t n) {
+    MEMORY_BASIC_INFORMATION mbi;
+    return VirtualQuery((void *)(uintptr_t)addr, &mbi, sizeof mbi) && mbi.Protect == PAGE_READONLY && mbi.RegionSize >= n;
 }
 
 int plat_mem_read(uint64_t addr, void *out, size_t n) {

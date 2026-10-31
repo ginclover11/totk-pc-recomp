@@ -8,8 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
-
+#include "platform/platform.h"
 #include "host.h"
 #include "tex.h"
 #include "vk.h"
@@ -110,9 +109,9 @@ static void to_general(VkCommandBuffer cb, VkImage img) {
 }
 
 static double now_ms(void) {
-    LARGE_INTEGER t, f;
-    QueryPerformanceCounter(&t), QueryPerformanceFrequency(&f);
-    return (double)t.QuadPart * 1e3 / (double)f.QuadPart;
+    int64_t t, f;
+    t = (int64_t)plat_counter(), f = (int64_t)plat_counter_hz();
+    return (double)t * 1e3 / (double)f;
 }
 
 // Decodes regions (w0 x h0 at level 0, w1 x h1 at level 1) of blk on the GPU; out_rb: the decoder's texels, out_img:
